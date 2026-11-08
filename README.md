@@ -52,7 +52,7 @@ empty, and that `restore` rewinds the `TICKS` counter in RAM.
 ## Add to Claude Code
 
 ```bash
-claude mcp add simbridge -- "C:/Users/Deep Samal/agentic-embedded-rust/simbridge/target/release/simbridge.exe"
+claude mcp add simbridge -- "D:/agentic-embedded-rust/simbridge/target/release/simbridge.exe"
 ```
 
 Then ask Claude something like: "load firmware/stm32f4-hello's release ELF on
