@@ -34,6 +34,27 @@ struct RunForArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct RunUntilArgs {
+    /// Stop when UART output (since the last serial() call) matches this regex.
+    uart_regex: Option<String>,
+    /// Stop when the 32-bit word here (number, "0x..." or ELF symbol) equals mem_equals.
+    mem_addr: Option<Value>,
+    /// Value to compare against (number or "0x..." string).
+    mem_equals: Option<Value>,
+    /// Give up after this much virtual time (default 1000 ms).
+    timeout_ms: Option<f64>,
+    /// Check conditions every this many virtual ms (default 1); the stop-time resolution.
+    step_ms: Option<f64>,
+}
+
+fn value_str(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        v => v.to_string(),
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct SerialArgs {
     /// Keep at most this many trailing bytes (default 4096).
     max_bytes: Option<usize>,
@@ -148,6 +169,35 @@ impl SimBridge {
         (deterministic), then pause. Returns the program counter.")]
     async fn run_for(&self, Parameters(a): Parameters<RunForArgs>) -> String {
         self.call(move |r| r.run_for(a.virtual_ms)).await
+    }
+
+    #[tool(description = "Run until a condition holds, checking every step_ms (default 1) of \
+        virtual time, up to timeout_ms (default 1000). Conditions: uart_regex matches UART \
+        output, and/or the 32-bit word at mem_addr (address or ELF symbol) equals mem_equals. \
+        Returns hit, stop reason, elapsed_virtual_ms and the UART text seen (consumed, so a \
+        later serial() won't repeat it).")]
+    async fn run_until(&self, Parameters(a): Parameters<RunUntilArgs>) -> String {
+        self.call(move |r| {
+            let want = match &a.mem_equals {
+                None => None,
+                Some(v) => {
+                    let s = value_str(v);
+                    let s = s.trim();
+                    Some(match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                        Some(h) => u64::from_str_radix(h, 16)?,
+                        None => s.parse::<u64>()?,
+                    })
+                }
+            };
+            r.run_until(
+                a.uart_regex.as_deref(),
+                a.mem_addr.as_ref().map(value_str).as_deref(),
+                want,
+                a.timeout_ms.unwrap_or(1000.0),
+                a.step_ms.unwrap_or(1.0),
+            )
+        })
+        .await
     }
 
     #[tool(description = "UART console output captured since the previous serial() call \

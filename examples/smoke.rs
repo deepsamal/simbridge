@@ -60,6 +60,13 @@ async fn main() -> Result<()> {
         call(&client, "run_for", json!({"virtual_ms": 20})).await?;
         call(&client, "serial", json!({})).await?;
         call(&client, "reset", json!({})).await?;
+        let u = call(&client, "run_until", json!({"uart_regex": r"tick 5\r", "timeout_ms": 500})).await?;
+        ensure!(u["hit"] == json!(true) && u["stop"]["reason"] == json!("uart"), "run_until uart");
+        let m = call(&client, "run_until", json!({"mem_addr": "TICKS", "mem_equals": 20, "timeout_ms": 500})).await?;
+        ensure!(m["hit"] == json!(true) && m["stop"]["reason"] == json!("mem"), "run_until mem");
+        let miss = call(&client, "run_until", json!({"uart_regex": "never", "timeout_ms": 5})).await?;
+        ensure!(miss["hit"] == json!(false), "run_until timeout");
+        call(&client, "reset", json!({})).await?;
         call(&client, "run_for", json!({"virtual_ms": 10})).await?;
         call(&client, "serial", json!({})).await?;
     }

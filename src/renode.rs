@@ -141,6 +141,10 @@ impl UartTap {
 
     fn take(&self) -> (Vec<u8>, usize) {
         thread::sleep(Duration::from_millis(50)); // let in-flight bytes land after RunFor
+        self.take_now()
+    }
+
+    fn take_now(&self) -> (Vec<u8>, usize) {
         let mut g = self.buf.lock().unwrap();
         (std::mem::take(&mut g.0), std::mem::take(&mut g.1))
     }
@@ -392,6 +396,71 @@ impl Renode {
             true,
         )?;
         Ok(json!({"pc": self.pc()}))
+    }
+
+    /// Advance in `step_ms` virtual-time slices until a stop condition holds or
+    /// `timeout_ms` of virtual time has passed. Conditions: UART output (since the
+    /// last serial() call) matches `uart_regex`, and/or the 32-bit word at `mem_addr`
+    /// (number or ELF symbol) equals `mem_equals`. Stop time is accurate to one step.
+    /// UART text seen here is consumed (returned in `text`, not by a later serial()).
+    pub fn run_until(
+        &mut self,
+        uart_regex: Option<&str>,
+        mem_addr: Option<&str>,
+        mem_equals: Option<u64>,
+        timeout_ms: f64,
+        step_ms: f64,
+    ) -> Result<Value> {
+        self.require_loaded()?;
+        let re = uart_regex.map(Regex::new).transpose().context("bad uart_regex")?;
+        let watch = match (mem_addr, mem_equals) {
+            (Some(a), Some(v)) => Some((self.resolve_addr(a)?, v)),
+            (None, None) => None,
+            _ => bail!("mem_addr and mem_equals must be given together"),
+        };
+        if re.is_none() && watch.is_none() {
+            bail!("give uart_regex and/or mem_addr + mem_equals");
+        }
+        if !(step_ms > 0.0 && timeout_ms > 0.0) {
+            bail!("step_ms and timeout_ms must be > 0");
+        }
+        let uart = self.require_loaded()?.uart;
+        let mut text: Vec<u8> = Vec::new();
+        let (mut elapsed, mut steps) = (0.0f64, 0u64);
+        let mut hit: Option<Value> = None;
+        while elapsed < timeout_ms && hit.is_none() {
+            let step = step_ms.min(timeout_ms - elapsed);
+            self.cmd_t(
+                &format!("emulation RunFor \"{:.9}\"", step / 1000.0),
+                Duration::from_secs(3600),
+                true,
+            )?;
+            elapsed += step;
+            steps += 1;
+            if let Some(re) = &re {
+                // UART bytes trail RunFor slightly; give the socket a moment.
+                thread::sleep(Duration::from_millis(2));
+                text.extend(self.uart.as_ref().map(|u| u.take_now().0).unwrap_or_default());
+                if let Some(m) = re.find(&String::from_utf8_lossy(&text)) {
+                    hit = Some(json!({"reason": "uart", "matched": m.as_str()}));
+                }
+            }
+            if let (None, Some((addr, want))) = (&hit, watch) {
+                let v = parse_hex(self.cmd(&format!("sysbus ReadDoubleWord 0x{addr:X}"))?.trim())?;
+                if v == want {
+                    hit = Some(json!({"reason": "mem", "addr": format!("0x{addr:08X}"),
+                                      "value": format!("0x{v:X}")}));
+                }
+            }
+        }
+        let tail = String::from_utf8_lossy(&text[text.len().saturating_sub(4096)..]).to_string();
+        let mut out = json!({"hit": hit.is_some(), "elapsed_virtual_ms": (elapsed * 1e6).round() / 1e6,
+                             "steps": steps, "resolution_ms": step_ms, "uart": uart,
+                             "text": tail, "pc": self.pc()});
+        if let Some(h) = hit {
+            out["stop"] = h;
+        }
+        Ok(out)
     }
 
     pub fn serial(&mut self, max_bytes: usize) -> Result<Value> {

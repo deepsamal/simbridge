@@ -21,6 +21,7 @@ time after the call) and `wall_ms` (the host time the call took).
 | `load(elf, platform="stm32f4", uart?)` | Creates a fresh machine and loads the ELF. Presets: `stm32f4` (`platforms/cpus/stm32f4.repl`, console `usart2`) and `fe310`/`hifive1` (`platforms/cpus/sifive-fe310.repl`, console `uart0`). Pass a `.repl` path and a `uart` to use any other board. |
 | `reset()` | Rebuilds the machine and reloads the same ELF, so virtual time goes back to 0. Traces stay enabled. |
 | `run_for(virtual_ms)` | Advances exactly that much virtual time, then pauses. Returns the PC. |
+| `run_until(uart_regex?, mem_addr?, mem_equals?, timeout_ms=1000, step_ms=1)` | Runs in `step_ms` slices until UART output matches the regex, or until the 32-bit word at `mem_addr` (address or ELF symbol) equals `mem_equals`, or until the timeout. Returns `hit`, `stop` (the reason), `elapsed_virtual_ms` and the UART text it saw. That text is consumed, so `serial()` won't return it again. The stop time is accurate to one step, and each step costs about 18 ms of wall time. |
 | `serial(max_bytes=4096)` | Returns UART output since the previous call. |
 | `regs(peripheral, count=8, offset=0)` | Reads 32-bit words from a peripheral's bus window. These are model reads, so registers with read side effects are affected. |
 | `mem(addr, length=64)` | Reads up to 1 KiB. `addr` can be a number, a `"0x..."` string or an ELF symbol such as `"TICKS"`. |
