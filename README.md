@@ -339,3 +339,8 @@ examples/smoke.rs    end-to-end test over MCP stdio, all boards
 firmware/            per-board hello firmware + common/hello.rs
 python/              the first prototype in Python, kept for reference
 ```
+
+## License
+
+MIT; see [LICENSE](LICENSE). Renode, the SVD files and the crates simbridge
+depends on keep their own licenses.

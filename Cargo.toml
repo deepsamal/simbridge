@@ -3,6 +3,8 @@ name = "simbridge"
 version = "0.1.0"
 edition = "2021"
 description = "Firmware-in-the-loop development for coding agents: runs real firmware on a Renode-simulated MCU over MCP"
+license = "MIT"
+repository = "https://github.com/deepsamal/simbridge"
 
 [dependencies]
 anyhow = "1.0.104"
