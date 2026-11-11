@@ -14,6 +14,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use regex::Regex;
 use serde_json::{json, Value};
 
+use crate::svd;
+
 const MACHINE: &str = "sb";
 const UART_BUF_MAX: usize = 1 << 20;
 const ERROR_MARKERS: &[&str] = &[
@@ -31,7 +33,8 @@ static VT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"Elapsed Virtual Time: (\d+):(\d+):(\d+(?:\.\d+)?)").unwrap());
 static TRACE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(concat!(
-        r"\[cpu: (0x[0-9A-Fa-f]+)\] (Read|Write)(\w+) (?:from|to) (0x[0-9A-Fa-f]+)",
+        // "[cpu: 0x...]" with one CPU; multi-core platforms name it ("[cpu1: 0x...]").
+        r"\[(cpu\w*): (0x[0-9A-Fa-f]+)\] (Read|Write)(\w+) (?:from|to) (0x[0-9A-Fa-f]+)",
         r"(?: \(([^)]*)\))?,? (?:returned|value) (0x[0-9A-Fa-f]+)"
     ))
     .unwrap()
@@ -39,13 +42,6 @@ static TRACE_RE: LazyLock<Regex> = LazyLock::new(|| {
 static RANGE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"<(0x[0-9A-Fa-f]+), (0x[0-9A-Fa-f]+)>").unwrap());
 static BYTE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"0x([0-9A-Fa-f]{2})\b").unwrap());
-
-/// Built-in platform presets: (name, repl shipped with Renode, console UART).
-const PLATFORMS: &[(&str, &str, &str)] = &[
-    ("stm32f4", "platforms/cpus/stm32f4.repl", "sysbus.usart2"),
-    ("fe310", "platforms/cpus/sifive-fe310.repl", "sysbus.uart0"),
-    ("hifive1", "platforms/cpus/sifive-fe310.repl", "sysbus.uart0"),
-];
 
 fn abs(path: &Path) -> Result<PathBuf> {
     Ok(std::path::absolute(path)?)
@@ -87,6 +83,55 @@ fn strip_iac(buf: &[u8]) -> Vec<u8> {
         i += 1;
     }
     out
+}
+
+/// Windows: a job object with KILL_ON_JOB_CLOSE. Renode is assigned to it, and
+/// the handle is never closed, so when simbridge exits for any reason (client
+/// gone, killed, crashed) Windows closes the handle and kills Renode with it.
+/// Without this, a Renode left over from a killed simbridge keeps its log file
+/// open and the next instance can't start.
+#[cfg(windows)]
+mod kill_on_exit {
+    use std::os::windows::io::AsRawHandle;
+    use std::sync::OnceLock;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    struct Job(HANDLE);
+    unsafe impl Send for Job {}
+    unsafe impl Sync for Job {}
+
+    static JOB: OnceLock<Option<Job>> = OnceLock::new();
+
+    fn job() -> Option<&'static Job> {
+        JOB.get_or_init(|| unsafe {
+            let h = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if h.is_null() {
+                return None;
+            }
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let ok = SetInformationJobObject(
+                h,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const core::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            (ok != 0).then_some(Job(h))
+        })
+        .as_ref()
+    }
+
+    /// Best effort: returns false if the job couldn't be set up.
+    pub fn attach(child: &std::process::Child) -> bool {
+        match job() {
+            Some(j) => unsafe { AssignProcessToJobObject(j.0, child.as_raw_handle() as HANDLE) != 0 },
+            None => false,
+        }
+    }
 }
 
 pub fn find_renode() -> Result<PathBuf> {
@@ -162,12 +207,26 @@ struct Loaded {
     platform: String,
     repl: String,
     uart: String,
+    cpu: String,
+    svd: Option<PathBuf>,
+}
+
+impl Loaded {
+    /// The SVD peripheral name to prefer for a Renode peripheral (presets can
+    /// pick one of several SVD views that share a base address).
+    fn svd_name<'a>(&self, renode_name: &'a str) -> &'a str {
+        crate::presets::find(&self.platform)
+            .and_then(|p| p.svd_alias.iter().find(|(r, _)| r.eq_ignore_ascii_case(renode_name)))
+            .map(|(_, s)| *s)
+            .unwrap_or(renode_name)
+    }
 }
 
 impl Loaded {
     fn json(&self) -> Value {
         json!({"elf": self.elf.display().to_string(), "platform": self.platform,
-               "repl": self.repl, "uart": self.uart})
+               "repl": self.repl, "uart": self.uart, "cpu": self.cpu,
+               "svd": self.svd.as_ref().map(|p| p.display().to_string())})
     }
 }
 
@@ -192,9 +251,13 @@ pub struct Renode {
 }
 
 impl Renode {
+    /// `workdir` is a parent folder: each simbridge process uses its own
+    /// `simbridge-<pid>` subfolder, so several instances (or a leftover Renode)
+    /// never fight over the same log or snapshot files.
     pub fn new(workdir: Option<PathBuf>) -> Result<Self> {
         let workdir = workdir
-            .unwrap_or_else(|| std::env::temp_dir().join(format!("simbridge-{}", std::process::id())));
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!("simbridge-{}", std::process::id()));
         std::fs::create_dir_all(&workdir)?;
         Ok(Self {
             renode_path: find_renode()?,
@@ -238,6 +301,8 @@ impl Renode {
             cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         }
         let mut child = cmd.spawn().with_context(|| format!("spawning {}", self.renode_path.display()))?;
+        #[cfg(windows)]
+        kill_on_exit::attach(&child);
         let sock = connect_retry(port, Duration::from_secs(60), || matches!(child.try_wait(), Ok(None)))
             .context("Renode monitor did not come up")?;
         sock.set_read_timeout(Some(Duration::from_millis(500)))?;
@@ -322,7 +387,8 @@ impl Renode {
     }
 
     fn pc(&mut self) -> Option<String> {
-        self.cmd("sysbus.cpu PC").ok()
+        let cpu = self.loaded.as_ref().map(|l| l.cpu.clone()).unwrap_or_else(|| "sysbus.cpu".into());
+        self.cmd(&format!("{cpu} PC")).ok()
     }
 
     fn attach_uart(&mut self) -> Result<()> {
@@ -347,30 +413,92 @@ impl Renode {
 
     // ---- operations --------------------------------------------------------
 
-    pub fn load(&mut self, elf: &Path, platform: &str, uart: Option<&str>) -> Result<Value> {
+    /// The parsed SVD of the loaded machine, if it has one.
+    pub fn svd_device(&self) -> Result<Option<Arc<svd::Device>>> {
+        match self.loaded.as_ref().and_then(|l| l.svd.as_ref()) {
+            Some(p) => Ok(Some(svd::load(p)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn loaded_svd_path(&self) -> Option<PathBuf> {
+        self.loaded.as_ref().and_then(|l| l.svd.clone())
+    }
+
+    pub fn load(
+        &mut self,
+        elf: &Path,
+        platform: &str,
+        uart: Option<&str>,
+        cpu: Option<&str>,
+        svd_arg: Option<&str>,
+    ) -> Result<Value> {
         if !elf.is_file() {
             bail!("ELF not found: {}", elf.display());
         }
-        let (repl, repl_arg, uart) =
-            match PLATFORMS.iter().find(|(n, _, _)| n.eq_ignore_ascii_case(platform)) {
-                Some((_, repl, u)) => (repl.to_string(), format!("@{repl}"), uart.unwrap_or(u).to_string()),
-                None => {
-                    let u = uart.ok_or_else(|| {
-                        anyhow!("custom platform needs an explicit uart (e.g. sysbus.usart1)")
-                    })?;
-                    (platform.to_string(), q(Path::new(platform)), u.to_string())
-                }
-            };
+        let mut warnings: Vec<String> = Vec::new();
+        // An explicit svd argument must resolve; a missing preset default only warns.
+        let svd_path = match svd::resolve(svd_arg, platform) {
+            Ok(p) => p,
+            Err(e) if svd_arg.is_none() => {
+                warnings.push(format!("no SVD: {e:#}"));
+                None
+            }
+            Err(e) => return Err(e),
+        };
+        let svd_dev = match &svd_path {
+            Some(p) => Some(svd::load(p)?),
+            None => None,
+        };
+        let (repl, repl_arg, uart, cpu) = match crate::presets::find(platform) {
+            Some(p) => (
+                p.repl.to_string(),
+                format!("@{}", p.repl),
+                uart.unwrap_or(p.uart).to_string(),
+                cpu.unwrap_or(p.cpu).to_string(),
+            ),
+            None if !platform.to_ascii_lowercase().ends_with(".repl") => bail!(
+                "unknown platform {platform:?}: use a preset ({}) or a path to a .repl file",
+                crate::presets::names()
+            ),
+            None => {
+                let u = uart.ok_or_else(|| {
+                    anyhow!("custom platform needs an explicit uart (e.g. sysbus.usart1)")
+                })?;
+                let c = cpu.unwrap_or("sysbus.cpu");
+                (platform.to_string(), q(Path::new(platform)), u.to_string(), c.to_string())
+            }
+        };
         self.cmd("Clear")?; // drop all machines (`mach clear` only deselects)
         self.traced.clear();
         self.cmd(&format!("mach create \"{MACHINE}\""))?;
         self.cmd(&format!("machine LoadPlatformDescription {repl_arg}"))?;
         self.cmd(&format!("sysbus LoadELF {}", q(elf)))?;
-        let loaded = Loaded { elf: abs(elf)?, platform: platform.to_string(), repl, uart };
+        // ApplySVD names registers in traces for regions Renode doesn't model.
+        // Best effort: field decoding in regs()/svd() works without it.
+        let mut apply_ms = None;
+        if let Some(p) = &svd_path {
+            let t = Instant::now();
+            match self.cmd(&format!("sysbus ApplySVD {}", q(p))) {
+                Ok(_) => apply_ms = Some(ms(t)),
+                Err(e) => warnings.push(format!("Renode ApplySVD failed (decoding still works): {e:#}")),
+            }
+        }
+        let loaded = Loaded { elf: abs(elf)?, platform: platform.to_string(), repl, uart, cpu, svd: svd_path };
         let mut info = loaded.json();
         self.loaded = Some(loaded);
         self.attach_uart()?;
         info["pc"] = json!(self.pc());
+        if let Some(d) = svd_dev {
+            info["svd_device"] = json!(d.name);
+            info["svd_peripherals"] = json!(d.peripherals.len());
+        }
+        if let Some(a) = apply_ms {
+            info["svd_apply_ms"] = json!(a);
+        }
+        if !warnings.is_empty() {
+            info["warnings"] = json!(warnings);
+        }
         Ok(info)
     }
 
@@ -378,7 +506,8 @@ impl Renode {
     pub fn reset(&mut self) -> Result<Value> {
         let l = self.require_loaded()?;
         let traced = self.traced.clone();
-        let info = self.load(&l.elf, &l.platform, Some(&l.uart))?;
+        let svd_arg = l.svd.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".into());
+        let info = self.load(&l.elf, &l.platform, Some(&l.uart), Some(&l.cpu), Some(&svd_arg))?;
         for p in traced {
             self.enable_trace(&p)?;
         }
@@ -496,20 +625,62 @@ impl Renode {
 
     /// Read `count` 32-bit words from the peripheral's bus window. Reads go through
     /// the model, so registers with read side effects behave as if the CPU read them.
-    pub fn regs(&mut self, peripheral: &str, count: u32, offset: u64) -> Result<Value> {
+    ///
+    /// With an SVD loaded, each word is decoded into its register(s) and fields.
+    /// `register` (an SVD register name) reads just that register.
+    pub fn regs(
+        &mut self,
+        peripheral: &str,
+        count: u32,
+        offset: u64,
+        register: Option<&str>,
+        verbose: bool,
+    ) -> Result<Value> {
         self.require_loaded()?;
         let (start, end) = self.peripheral_range(peripheral)?;
+        let dev = self.svd_device()?;
+        let name = self.require_loaded()?.svd_name(Self::short(peripheral)).to_string();
+        let sp = dev.as_ref().and_then(|d| d.find(&name, Some(start)));
+        let (offset, count) = match register {
+            Some(name) => {
+                let sp = sp.ok_or_else(|| {
+                    anyhow!("register lookup needs an SVD peripheral matching {peripheral} at 0x{start:08X}")
+                })?;
+                let r = sp.register(name).ok_or_else(|| {
+                    anyhow!("{} has no register {name:?}; try svd(peripheral={:?})", sp.name, sp.name)
+                })?;
+                (r.offset & !3, r.size.div_ceil(32).max(1))
+            }
+            None => (offset, count),
+        };
         let room = ((end - start + 1).saturating_sub(offset) / 4) as u32;
         let count = count.clamp(1, 64).min(room);
         let mut words = Vec::new();
         for i in 0..count as u64 {
             let off = offset + 4 * i;
             let v = self.cmd(&format!("sysbus ReadDoubleWord 0x{:X}", start + off))?;
-            words.push(json!({"offset": format!("0x{off:X}"),
-                              "value": v.split_whitespace().next().unwrap_or("")}));
+            let raw = v.split_whitespace().next().unwrap_or("").to_string();
+            let mut w = json!({"offset": format!("0x{off:X}"), "value": raw});
+            if let (Some(sp), Ok(val)) = (sp, parse_hex(&raw)) {
+                let decoded: Vec<Value> = sp
+                    .decode_word(off, val, verbose)
+                    .into_iter()
+                    .filter(|d| register.is_none_or(|n| d["register"].as_str().is_some_and(|r| r.eq_ignore_ascii_case(n))))
+                    .collect();
+                if !decoded.is_empty() {
+                    w["registers"] = json!(decoded);
+                }
+            }
+            words.push(w);
         }
-        Ok(json!({"peripheral": Self::short(peripheral), "base": format!("0x{start:08X}"),
-                  "size": end - start + 1, "words": words}))
+        let mut out = json!({"peripheral": Self::short(peripheral), "base": format!("0x{start:08X}"),
+                             "size": end - start + 1, "words": words});
+        if let Some(sp) = sp {
+            out["svd_peripheral"] = json!(sp.name);
+        } else if let Some(d) = &dev {
+            out["note"] = json!(format!("no peripheral at 0x{start:08X} in SVD {}; raw words only", d.name));
+        }
+        Ok(out)
     }
 
     pub fn mem(&mut self, addr: &str, length: u32) -> Result<Value> {
@@ -534,7 +705,7 @@ impl Renode {
     }
 
     /// Accesses logged since the previous call (the first call enables tracing).
-    pub fn peripheral_trace(&mut self, peripheral: &str, limit: usize, disable: bool) -> Result<Value> {
+    pub fn peripheral_trace(&mut self, peripheral: &str, limit: usize, disable: bool, decode: bool) -> Result<Value> {
         self.require_loaded()?;
         let short = Self::short(peripheral).to_string();
         if !self.traced.contains(&short) {
@@ -549,14 +720,18 @@ impl Renode {
         f.read_to_end(&mut chunk)?;
         self.log_offsets.insert(short.clone(), start + chunk.len() as u64);
         // Renode tags lines "usart2:" with one machine, "sb/usart2:" with several.
-        let tag = Regex::new(&format!(r"[\] /]{}: \[cpu", regex::escape(&short)))?;
+        let tag = Regex::new(&format!(r"[\] /]{}: \[cpu\w*:", regex::escape(&short)))?;
         let accesses: Vec<Value> = String::from_utf8_lossy(&chunk)
             .lines()
             .filter(|l| tag.is_match(l))
             .filter_map(|l| TRACE_RE.captures(l))
             .map(|c| {
-                json!({"pc": &c[1], "op": &c[2][..1], "width": &c[3], "offset": &c[4],
-                       "reg": c.get(5).map(|m| m.as_str()), "value": &c[6]})
+                let mut a = json!({"pc": &c[2], "op": &c[3][..1], "width": &c[4], "offset": &c[5],
+                                   "reg": c.get(6).map(|m| m.as_str()), "value": &c[7]});
+                if &c[1] != "cpu" {
+                    a["cpu"] = json!(&c[1]); // which core made the access
+                }
+                a
             })
             .collect();
         let total = accesses.len();
@@ -564,7 +739,27 @@ impl Renode {
             self.cmd(&format!("sysbus LogPeripheralAccess sysbus.{short} false"))?;
             self.traced.remove(&short);
         }
-        let tail = accesses[total.saturating_sub(limit)..].to_vec();
+        let mut tail = accesses[total.saturating_sub(limit)..].to_vec();
+        if decode {
+            let base = self.peripheral_range(&short).ok().map(|r| r.0);
+            if let Some(dev) = self.svd_device()? {
+                let name = self.require_loaded()?.svd_name(&short).to_string();
+                if let Some(sp) = dev.find(&name, base) {
+                    for a in tail.iter_mut() {
+                        let (Some(off), Some(val)) = (
+                            a["offset"].as_str().and_then(|s| parse_hex(s).ok()),
+                            a["value"].as_str().and_then(|s| parse_hex(s).ok()),
+                        ) else { continue };
+                        // Trace offsets may be absolute on some Renode versions.
+                        let off = match base { Some(b) if off >= b => off - b, _ => off };
+                        let d = sp.decode_word(off & !3, val << ((off & 3) * 8), false);
+                        if !d.is_empty() {
+                            a["decoded"] = json!(d);
+                        }
+                    }
+                }
+            }
+        }
         Ok(json!({"peripheral": short, "total": total, "returned": tail.len(), "accesses": tail}))
     }
 
@@ -616,4 +811,19 @@ fn parse_hex(s: &str) -> Result<u64> {
 
 pub fn ms(t: Instant) -> f64 {
     (t.elapsed().as_secs_f64() * 10_000.0).round() / 10.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TRACE_RE;
+
+    #[test]
+    fn trace_line_single_and_multi_core() {
+        let one = "[12:11:54.2010]  [INFO] usart2: [cpu: 0x800052E] ReadUInt32 from 0x0 (Status), returned 0xC0";
+        let c = TRACE_RE.captures(one).unwrap();
+        assert_eq!((&c[1], &c[2], &c[6], &c[7]), ("cpu", "0x800052E", "Status", "0xC0"));
+        let two = "[18:38:57.1041]  [INFO] uart: [cpu1: 0x8000030C] WriteUInt32 to 0x0 (TransmitData), value 0x68";
+        let c = TRACE_RE.captures(two).unwrap();
+        assert_eq!((&c[1], &c[3], &c[5], &c[7]), ("cpu1", "Write", "0x0", "0x68"));
+    }
 }

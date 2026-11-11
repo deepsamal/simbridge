@@ -1,5 +1,5 @@
 //! End-to-end test: spawn the simbridge binary and drive it over MCP stdio, exactly
-//! as Claude Code would, on both boards.
+//! as Claude Code would, on every preset board.
 //!
 //!     cargo build --release && cargo run --release --example smoke
 
@@ -28,16 +28,45 @@ async fn call(c: &RunningService<RoleClient, ()>, name: &'static str, args: Valu
 #[tokio::main]
 async fn main() -> Result<()> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // `cargo run --example smoke` builds only this example, never the server
+    // binary it drives, so build that first or we'd test a stale simbridge.
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let status = std::process::Command::new(cargo)
+        .args(["build", "--release", "--bin", "simbridge"])
+        .current_dir(&root)
+        .status()?;
+    ensure!(status.success(), "building simbridge failed");
     let exe = root.join("target/release/simbridge").with_extension(std::env::consts::EXE_EXTENSION);
-    let client = ().serve(TokioChildProcess::new(tokio::process::Command::new(&exe))?).await?;
+    // The main pass needs every tool and no log, whatever the caller's environment says.
+    let mut cmd = tokio::process::Command::new(&exe);
+    cmd.env_remove("SIMBRIDGE_TOOLS").env_remove("SIMBRIDGE_LOG");
+    let client = ().serve(TokioChildProcess::new(cmd)?).await?;
     let tools: Vec<String> = client.list_all_tools().await?.into_iter().map(|t| t.name.to_string()).collect();
     println!("tools: {tools:?}");
 
+    // (preset, console UART, ELF, SVD peripheral, a status register to decode)
     let boards = [
-        ("stm32f4", "usart2", "firmware/stm32f4-hello/target/thumbv7em-none-eabihf/release/stm32f4-hello"),
-        ("fe310", "uart0", "firmware/fe310-hello/target/riscv32imac-unknown-none-elf/release/fe310-hello"),
+        ("stm32f4", "usart2", "firmware/stm32f4-hello/target/thumbv7em-none-eabihf/release/stm32f4-hello",
+         "USART2", "SR"),
+        ("fe310", "uart0", "firmware/fe310-hello/target/riscv32imac-unknown-none-elf/release/fe310-hello",
+         "UART0", "txdata"),
+        ("nrf52840", "uart0", "firmware/nrf52840-hello/target/thumbv7em-none-eabihf/release/nrf52840-hello",
+         "UARTE0", "ENABLE"),
+        ("stm32f103", "usart2", "firmware/stm32f103-hello/target/thumbv7m-none-eabi/release/stm32f103-hello",
+         "USART2", "SR"),
+        ("stm32f072", "usart2", "firmware/stm32f072-hello/target/thumbv6m-none-eabi/release/stm32f072-hello",
+         "USART2", "ISR"),
+        ("stm32l552", "usart2", "firmware/stm32l552-hello/target/thumbv8m.main-none-eabihf/release/stm32l552-hello",
+         "USART2", "ISR"),
+        ("k210", "uart", "firmware/k210-hello/target/riscv64imac-unknown-none-elf/release/k210-hello",
+         "UARTHS", "txdata"),
     ];
-    for (platform, uart, elf) in boards {
+    // `cargo run --example smoke -- nrf52840 k210` runs just those boards.
+    let only: Vec<String> = std::env::args().skip(1).collect();
+    for (platform, uart, elf, svd_periph, status_reg) in boards {
+        if !only.is_empty() && !only.iter().any(|o| o == platform) {
+            continue;
+        }
         println!("=== {platform}");
         let elf = root.join(elf);
         call(&client, "load", json!({"elf": elf, "platform": platform})).await?;
@@ -47,7 +76,15 @@ async fn main() -> Result<()> {
         ensure!(s["text"].as_str().unwrap_or("").contains("hello from"), "no banner");
         let t = call(&client, "peripheral_trace", json!({"peripheral": uart, "limit": 2})).await?;
         ensure!(t["total"].as_u64().unwrap_or(0) > 0, "empty trace");
-        call(&client, "regs", json!({"peripheral": uart, "count": 4})).await?;
+        let r = call(&client, "regs", json!({"peripheral": uart, "count": 4})).await?;
+        ensure!(r["svd_peripheral"] == json!(svd_periph), "regs not matched to SVD: {r}");
+        let r = call(&client, "regs", json!({"peripheral": uart, "register": status_reg})).await?;
+        ensure!(r["words"][0]["registers"][0]["fields"].is_array(), "no decoded fields: {r}");
+        let s = call(&client, "svd", json!({"peripheral": svd_periph, "register": status_reg})).await?;
+        ensure!(s["fields"].as_array().is_some_and(|f| !f.is_empty()), "svd lookup empty");
+        call(&client, "svd", json!({"query": status_reg, "limit": 3})).await?;
+        let t = call(&client, "peripheral_trace", json!({"peripheral": uart, "limit": 2, "decode": true})).await?;
+        ensure!(t["total"].as_u64() == Some(0) || t["accesses"][0]["decoded"].is_array(), "trace not decoded");
         let before = call(&client, "mem", json!({"addr": "TICKS", "length": 4})).await?;
         let snap = call(&client, "snapshot", json!({})).await?;
         call(&client, "run_for", json!({"virtual_ms": 50})).await?;
@@ -71,6 +108,36 @@ async fn main() -> Result<()> {
         call(&client, "serial", json!({})).await?;
     }
     client.cancel().await?;
+
+    // Feedback condition C2 + call log: a second server exposing only the console tools.
+    println!("=== C2 allowlist + call log");
+    let log_path = std::env::temp_dir().join(format!("simbridge-smoke-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&log_path);
+    let mut cmd = tokio::process::Command::new(&exe);
+    cmd.env("SIMBRIDGE_TOOLS", "C2").env("SIMBRIDGE_LOG", &log_path);
+    let c2 = ().serve(TokioChildProcess::new(cmd)?).await?;
+    let mut names: Vec<String> = c2.list_all_tools().await?.into_iter().map(|t| t.name.to_string()).collect();
+    names.sort();
+    ensure!(names == ["load", "reset", "run_for", "run_until", "serial"], "C2 exposes {names:?}");
+    let regs = CallToolRequestParams::new("regs")
+        .with_arguments(json!({"peripheral": "usart2"}).as_object().cloned().unwrap_or_default());
+    ensure!(c2.call_tool(regs).await.is_err(), "regs was callable under C2");
+    let elf = root.join(boards[0].2); // stm32f4
+    call(&c2, "load", json!({"elf": elf, "platform": "stm32f4"})).await?;
+    call(&c2, "run_for", json!({"virtual_ms": 50})).await?;
+    call(&c2, "serial", json!({})).await?;
+    c2.cancel().await?;
+    let lines: Vec<Value> = std::fs::read_to_string(&log_path)?
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()?;
+    println!("call log: {} lines, last: {}", lines.len(), lines.last().map(|l| l.to_string()).unwrap_or_default());
+    ensure!(lines.len() == 5, "expected start + 4 calls in the log, got {}", lines.len());
+    ensure!(lines[0]["event"] == json!("start"), "first log line is not the start event");
+    ensure!(lines[1]["tool"] == json!("regs") && lines[1]["ok"] == json!(false), "hidden call not logged as failed");
+    ensure!(lines[3]["tool"] == json!("run_for") && lines[3]["t_virtual_s"] == json!(0.05), "run_for virtual time not logged");
+    ensure!(lines[4]["result_bytes"].as_u64().unwrap_or(0) > 0, "serial result size not logged");
+    let _ = std::fs::remove_file(&log_path);
     println!("MCP OK");
     Ok(())
 }
