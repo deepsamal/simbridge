@@ -39,7 +39,7 @@ async fn main() -> Result<()> {
     let exe = root.join("target/release/simbridge").with_extension(std::env::consts::EXE_EXTENSION);
     // The main pass needs every tool and no log, whatever the caller's environment says.
     let mut cmd = tokio::process::Command::new(&exe);
-    cmd.env_remove("SIMBRIDGE_TOOLS").env_remove("SIMBRIDGE_LOG");
+    cmd.env_remove("SIMBRIDGE_TOOLS").env_remove("SIMBRIDGE_LOG").env_remove("SIMBRIDGE_MODE");
     let client = ().serve(TokioChildProcess::new(cmd)?).await?;
     let tools: Vec<String> = client.list_all_tools().await?.into_iter().map(|t| t.name.to_string()).collect();
     println!("tools: {tools:?}");
@@ -114,7 +114,7 @@ async fn main() -> Result<()> {
     let log_path = std::env::temp_dir().join(format!("simbridge-smoke-{}.jsonl", std::process::id()));
     let _ = std::fs::remove_file(&log_path);
     let mut cmd = tokio::process::Command::new(&exe);
-    cmd.env("SIMBRIDGE_TOOLS", "C2").env("SIMBRIDGE_LOG", &log_path);
+    cmd.env("SIMBRIDGE_TOOLS", "C2").env("SIMBRIDGE_LOG", &log_path).env_remove("SIMBRIDGE_MODE");
     let c2 = ().serve(TokioChildProcess::new(cmd)?).await?;
     let mut names: Vec<String> = c2.list_all_tools().await?.into_iter().map(|t| t.name.to_string()).collect();
     names.sort();
@@ -138,6 +138,26 @@ async fn main() -> Result<()> {
     ensure!(lines[3]["tool"] == json!("run_for") && lines[3]["t_virtual_s"] == json!(0.05), "run_for virtual time not logged");
     ensure!(lines[4]["result_bytes"].as_u64().unwrap_or(0) > 0, "serial result size not logged");
     let _ = std::fs::remove_file(&log_path);
+
+    // Grader mode: the grader-only `monitor` tool appears and runs raw monitor commands.
+    println!("=== grader mode");
+    ensure!(!tools.iter().any(|t| t == "monitor"), "monitor exposed in agent mode");
+    let mut cmd = tokio::process::Command::new(&exe);
+    cmd.env("SIMBRIDGE_MODE", "grader").env_remove("SIMBRIDGE_TOOLS").env_remove("SIMBRIDGE_LOG");
+    let gr = ().serve(TokioChildProcess::new(cmd)?).await?;
+    let gtools: Vec<String> = gr.list_all_tools().await?.into_iter().map(|t| t.name.to_string()).collect();
+    ensure!(gtools.iter().any(|t| t == "monitor"), "grader mode lacks monitor: {gtools:?}");
+    call(&gr, "load", json!({"elf": elf, "platform": "stm32f4"})).await?;
+    // Trace read immediately after a very short run: Renode writes its log
+    // asynchronously, so this fails if peripheral_trace doesn't wait for it.
+    call(&gr, "peripheral_trace", json!({"peripheral": "usart2"})).await?;
+    call(&gr, "run_for", json!({"virtual_ms": 1})).await?;
+    let t = call(&gr, "peripheral_trace", json!({"peripheral": "usart2", "limit": 1000})).await?;
+    ensure!(t["total"].as_u64().unwrap_or(0) > 0 && t.get("warning").is_none(), "trace missed fresh accesses: {t}");
+    call(&gr, "run_for", json!({"virtual_ms": 10})).await?;
+    let pc = call(&gr, "monitor", json!({"command": "sysbus.cpu PC"})).await?;
+    ensure!(pc["output"].as_str().is_some_and(|o| o.contains("0x")), "monitor PC: {pc}");
+    gr.cancel().await?;
     println!("MCP OK");
     Ok(())
 }

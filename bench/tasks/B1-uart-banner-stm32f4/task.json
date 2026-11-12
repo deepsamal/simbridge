@@ -1,0 +1,10 @@
+{
+  "id": "B1-uart-banner-stm32f4",
+  "family": "F1",
+  "board": "stm32f4",
+  "target": "thumbv7em-none-eabihf",
+  "package": "b1-firmware",
+  "budget": {"max_iterations": 20, "max_tool_calls": 150, "max_wall_min": 30, "max_tokens": 2000000},
+  "trials": 3,
+  "faults": ["X1-rxne-instead-of-txe"]
+}

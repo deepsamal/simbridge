@@ -248,6 +248,7 @@ pub struct Renode {
     log_offsets: BTreeMap<String, u64>,
     snapshots: BTreeMap<String, Snapshot>,
     term_seq: u32,
+    sync_seq: u64,
 }
 
 impl Renode {
@@ -271,6 +272,7 @@ impl Renode {
             log_offsets: BTreeMap::new(),
             snapshots: BTreeMap::new(),
             term_seq: 0,
+            sync_seq: 0,
         })
     }
 
@@ -310,7 +312,9 @@ impl Renode {
         self.sock = Some(sock);
         self.read_until_prompt(Duration::from_secs(60))?;
         let log = q(&self.log_path);
-        self.cmd(&format!("logFile {log}"))?;
+        // Flush after every write: Renode's file logger otherwise flushes on a
+        // 5 s timer, and peripheral_trace reads this file.
+        self.cmd(&format!("logFile {log} true"))?;
         Ok(())
     }
 
@@ -683,6 +687,13 @@ impl Renode {
         Ok(out)
     }
 
+    /// Grader only: one raw monitor command, output returned as text. Monitor
+    /// errors are returned in `output`, not raised, so the grader can inspect them.
+    pub fn monitor(&mut self, line: &str) -> Result<Value> {
+        let out = self.cmd_t(line, Duration::from_secs(120), false)?;
+        Ok(json!({"command": line, "output": out}))
+    }
+
     pub fn mem(&mut self, addr: &str, length: u32) -> Result<Value> {
         self.require_loaded()?;
         let a = self.resolve_addr(addr)?;
@@ -704,6 +715,37 @@ impl Renode {
         Ok(())
     }
 
+    /// Read the log from `start` up to a sync point. Renode's logger hands entries
+    /// to a background thread, so the file can lag the simulation slightly. We log
+    /// a unique line with the monitor's `log` command and wait for it: entries go
+    /// through one ordered queue, so once it's in the file, every access logged
+    /// before it is too. Returns the bytes before the sync line, how many bytes to
+    /// consume (through the sync line), and whether it appeared within the timeout.
+    fn read_log_synced(&mut self, start: u64) -> Result<(Vec<u8>, u64, bool)> {
+        self.sync_seq += 1;
+        let token = format!("simbridge-sync-{}", self.sync_seq);
+        let marker = Regex::new(&format!(r"{}\b", regex::escape(&token)))?;
+        self.cmd(&format!("log \"{token}\""))?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut buf = Vec::new();
+            let mut f = File::open(&self.log_path)?; // std opens with FILE_SHARE_READ|WRITE on Windows
+            f.seek(SeekFrom::Start(start))?;
+            f.read_to_end(&mut buf)?;
+            let text = String::from_utf8_lossy(&buf);
+            if let Some(m) = marker.find(&text) {
+                // Accesses end where the sync line starts; consume through its newline.
+                let line_start = text[..m.start()].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                let line_end = text[m.end()..].find('\n').map(|i| m.end() + i + 1).unwrap_or(text.len());
+                return Ok((text.as_bytes()[..line_start].to_vec(), line_end as u64, true));
+            }
+            if Instant::now() > deadline {
+                return Ok((buf.clone(), buf.len() as u64, false));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Accesses logged since the previous call (the first call enables tracing).
     pub fn peripheral_trace(&mut self, peripheral: &str, limit: usize, disable: bool, decode: bool) -> Result<Value> {
         self.require_loaded()?;
@@ -714,11 +756,8 @@ impl Renode {
                              "note": "tracing enabled; run_for() then call again"}));
         }
         let start = *self.log_offsets.get(&short).unwrap_or(&0);
-        let mut chunk = Vec::new();
-        let mut f = File::open(&self.log_path)?; // std opens with FILE_SHARE_READ|WRITE on Windows
-        f.seek(SeekFrom::Start(start))?;
-        f.read_to_end(&mut chunk)?;
-        self.log_offsets.insert(short.clone(), start + chunk.len() as u64);
+        let (chunk, consumed, synced) = self.read_log_synced(start)?;
+        self.log_offsets.insert(short.clone(), start + consumed);
         // Renode tags lines "usart2:" with one machine, "sb/usart2:" with several.
         let tag = Regex::new(&format!(r"[\] /]{}: \[cpu\w*:", regex::escape(&short)))?;
         let accesses: Vec<Value> = String::from_utf8_lossy(&chunk)
@@ -760,7 +799,11 @@ impl Renode {
                 }
             }
         }
-        Ok(json!({"peripheral": short, "total": total, "returned": tail.len(), "accesses": tail}))
+        let mut out = json!({"peripheral": short, "total": total, "returned": tail.len(), "accesses": tail});
+        if !synced {
+            out["warning"] = json!("Renode's log did not catch up within 10 s; the most recent accesses may be missing");
+        }
+        Ok(out)
     }
 
     pub fn snapshot(&mut self) -> Result<Value> {
@@ -816,6 +859,13 @@ pub fn ms(t: Instant) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::TRACE_RE;
+
+    #[test]
+    fn sync_marker_is_exact() {
+        let m = regex::Regex::new(&format!(r"{}\b", regex::escape("simbridge-sync-7"))).unwrap();
+        assert!(m.is_match("[INFO] monitor: Script: simbridge-sync-7"));
+        assert!(!m.is_match("[INFO] monitor: Script: simbridge-sync-70"));
+    }
 
     #[test]
     fn trace_line_single_and_multi_core() {

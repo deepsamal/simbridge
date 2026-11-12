@@ -122,6 +122,16 @@ struct TraceArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct MonitorArgs {
+    /// One Renode monitor command, e.g. `sysbus.cpu ExecutedInstructions`.
+    command: String,
+}
+
+/// Tools that exist only for the benchmark grader (`SIMBRIDGE_MODE=grader`).
+/// They are removed in agent mode, so no allowlist can expose them to an agent.
+const GRADER_ONLY: &[&str] = &["monitor"];
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct RestoreArgs {
     /// Snapshot id returned by snapshot().
     id: String,
@@ -141,6 +151,17 @@ impl SimBridge {
     /// listed nor callable), and opens `SIMBRIDGE_LOG`.
     fn new(state: State) -> anyhow::Result<Self> {
         let mut tool_router = Self::tool_router();
+        let mode = std::env::var("SIMBRIDGE_MODE").unwrap_or_default();
+        let grader = match mode.trim().to_ascii_lowercase().as_str() {
+            "" | "agent" => false,
+            "grader" => true,
+            other => anyhow::bail!("SIMBRIDGE_MODE must be agent (default) or grader, not {other:?}"),
+        };
+        if !grader {
+            for t in GRADER_ONLY {
+                tool_router.remove_route(t);
+            }
+        }
         let all: Vec<String> = tool_router.list_all().iter().map(|t| t.name.to_string()).collect();
         let allow = calllog::parse_allowlist(std::env::var("SIMBRIDGE_TOOLS").ok().as_deref(), &all)?;
         if let Some(allow) = &allow {
@@ -149,7 +170,7 @@ impl SimBridge {
             }
         }
         let exposed: Vec<String> = tool_router.list_all().iter().map(|t| t.name.to_string()).collect();
-        let log = Arc::new(calllog::CallLog::from_env(&exposed)?);
+        let log = Arc::new(calllog::CallLog::from_env(&exposed, if grader { "grader" } else { "agent" })?);
         Ok(Self { state, tool_router, log })
     }
 
@@ -364,6 +385,12 @@ impl SimBridge {
             )
         })
         .await
+    }
+
+    #[tool(description = "Grader only: run one raw Renode monitor command and return its \
+        text output (e.g. `sysbus.cpu ExecutedInstructions`). Errors come back in the output.")]
+    async fn monitor(&self, Parameters(a): Parameters<MonitorArgs>) -> String {
+        self.call(move |r| r.monitor(&a.command)).await
     }
 
     #[tool(description = "Save full emulation state (Renode `Save`). Returns an id for \

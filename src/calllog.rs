@@ -66,7 +66,7 @@ fn unix_ms() -> u64 {
 
 impl CallLog {
     /// Opens `SIMBRIDGE_LOG` for appending (if set) and writes a start line.
-    pub fn from_env(tools: &[String]) -> Result<Self> {
+    pub fn from_env(tools: &[String], mode: &str) -> Result<Self> {
         let file = match std::env::var_os("SIMBRIDGE_LOG") {
             Some(p) => {
                 let f = OpenOptions::new()
@@ -80,7 +80,7 @@ impl CallLog {
         };
         let log = Self { file, start: Instant::now(), seq: AtomicU64::new(0) };
         log.write(json!({"event": "start", "t_unix_ms": unix_ms(), "pid": std::process::id(),
-                         "version": env!("CARGO_PKG_VERSION"), "tools": tools}));
+                         "version": env!("CARGO_PKG_VERSION"), "mode": mode, "tools": tools}));
         Ok(log)
     }
 

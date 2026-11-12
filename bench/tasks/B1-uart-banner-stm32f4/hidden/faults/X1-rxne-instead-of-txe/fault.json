@@ -1,0 +1,10 @@
+{
+  "id": "X1",
+  "class": "wrong_register_bit",
+  "peripheral": "USART2",
+  "register": "SR",
+  "field": "TXE",
+  "location": "src/main.rs:16",
+  "description": "Waits on SR bit 5 (RXNE) instead of bit 7 (TXE) before each write to DR. RXNE never sets with no input, so the first putc spins forever.",
+  "symptom": "Nothing is printed after reset."
+}

@@ -224,6 +224,7 @@ that each of them parses.
 | `SIMBRIDGE_WORKDIR` | system temp dir | where Renode's log and snapshots go; each simbridge process uses its own `simbridge-<pid>` subfolder |
 | `SIMBRIDGE_TOOLS` | all tools | which tools are exposed: tool names and/or the feedback conditions `C2`, `C3`, `C4`, separated by commas or spaces. Hidden tools are neither listed nor callable. An unknown name stops the server at startup |
 | `SIMBRIDGE_LOG` | off | append one JSON line per tool call to this file (see below) |
+| `SIMBRIDGE_MODE` | `agent` | `grader` adds grader-only tools (`monitor`: a raw Renode monitor command) for benchmark graders. In agent mode they don't exist, and `SIMBRIDGE_TOOLS` can't expose them |
 
 ### Feedback conditions and the call log
 
@@ -335,8 +336,10 @@ src/main.rs          MCP tool definitions (rmcp)
 src/renode.rs        Renode process, monitor protocol, UART tap, traces, snapshots
 src/svd.rs           SVD parsing, index, field decoding, search
 src/presets.rs       board presets
+src/calllog.rs       SIMBRIDGE_TOOLS allowlist and SIMBRIDGE_LOG call log
 examples/smoke.rs    end-to-end test over MCP stdio, all boards
 firmware/            per-board hello firmware + common/hello.rs
+bench/               simbridge-bench: grading client, task format, validator, tasks
 python/              the first prototype in Python, kept for reference
 ```
 
