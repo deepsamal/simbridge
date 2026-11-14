@@ -148,11 +148,11 @@ time after the call) and `wall_ms` (the host time the call took).
 | `reset()` | Rebuilds the machine and reloads the same ELF, so virtual time goes back to 0. Traces stay enabled. |
 | `run_for(virtual_ms)` | Advances exactly that much virtual time, then pauses. Returns the PC. |
 | `run_until(uart_regex?, mem_addr?, mem_equals?, timeout_ms=1000, step_ms=1)` | Runs in `step_ms` slices until UART output matches the regex, or until the 32-bit word at `mem_addr` (address or ELF symbol) equals `mem_equals`, or until the timeout. Returns `hit`, `stop` (the reason), `elapsed_virtual_ms` and the UART text it saw. That text is consumed, so `serial()` won't return it again. The stop time is accurate to one step, and each step costs about 15–25 ms of wall time. |
-| `serial(max_bytes=4096)` | Returns UART output since the previous call. |
+| `serial(max_bytes=4096)` | Returns UART output since the previous call, with `t_from` / `t_to`: the virtual-time window it was produced in. |
 | `regs(peripheral, count=8, offset=0, register?, verbose=false)` | Reads 32-bit words from a peripheral's bus window. With an SVD, each word is decoded into its register(s) and fields (bit range, value, matching enum name); `register="SR"` reads one register by name, `verbose` adds descriptions. The Renode peripheral is matched to the SVD by base address, so `gpioPortA` finds `GPIOA`. These are model reads, so registers with read side effects are affected (flagged as `read_side_effect` when the SVD says so). |
 | `svd(svd?, peripheral?, register?, value?, query?, limit=40)` | SVD lookup that doesn't touch the simulator. No arguments: list peripherals. `peripheral`: its registers. `peripheral` + `register`: every field with bits, access, description and enumerated values; add `value` to decode a number. `query`: regex search over names and descriptions. Uses the loaded machine's SVD unless `svd` names a path or preset. |
 | `mem(addr, length=64)` | Reads up to 1 KiB. `addr` can be a number, a `"0x..."` string or an ELF symbol such as `"TICKS"`. |
-| `peripheral_trace(peripheral, limit=50, disable=false, decode=false)` | The first call turns on `LogPeripheralAccess`. Later calls return the accesses since the previous call: PC, R/W, offset, register name and value, plus the CPU on multi-core boards. `decode` adds the SVD field breakdown of each value. |
+| `peripheral_trace(peripheral, limit=50, disable=false, decode=false)` | The first call turns on `LogPeripheralAccess`. Later calls return the accesses since the previous call: PC, R/W, offset, register name and value, the virtual time `t` in seconds, plus the CPU on multi-core boards. `time_resolution_s` gives the timestamp resolution (see Notes). `decode` adds the SVD field breakdown of each value. |
 | `snapshot()` / `restore(id)` | Renode `Save` / `Load` of the full state. Each reports how long it took. |
 
 ## Board presets
@@ -224,6 +224,7 @@ that each of them parses.
 | `SIMBRIDGE_WORKDIR` | system temp dir | where Renode's log and snapshots go; each simbridge process uses its own `simbridge-<pid>` subfolder |
 | `SIMBRIDGE_TOOLS` | all tools | which tools are exposed: tool names and/or the feedback conditions `C2`, `C3`, `C4`, separated by commas or spaces. Hidden tools are neither listed nor callable. An unknown name stops the server at startup |
 | `SIMBRIDGE_LOG` | off | append one JSON line per tool call to this file (see below) |
+| `SIMBRIDGE_QUANTUM_US` | `100` | Renode's global quantum in microseconds: how often virtual time is synchronised, and so the resolution of trace timestamps. Smaller is finer and slower |
 | `SIMBRIDGE_MODE` | `agent` | `grader` adds grader-only tools (`monitor`: a raw Renode monitor command) for benchmark graders. In agent mode they don't exist, and `SIMBRIDGE_TOOLS` can't expose them |
 
 ### Feedback conditions and the call log
@@ -300,6 +301,15 @@ The first call also pays Renode's cold start, about 1–5 s.
 
 ## Notes
 
+- Trace timestamps are Renode's log timestamps in virtual time. simbridge
+  starts Renode with its own `--config` file (in the work folder; your Renode
+  config is untouched) that sets `log-timestamps-type = Virtual` and turns off
+  merging of repeated log lines, which would otherwise collapse a polling loop
+  into one access. Each timestamp is the virtual time of the last quantum
+  boundary, so an access is stamped up to one quantum (100 us by default) early.
+- Renode writes its log file in the background: simbridge starts it with
+  flush-after-every-write and, before each trace read, logs a unique sync line
+  and waits for it, so a read never misses the latest accesses.
 - The nRF52840 preset maps `uart0`/`uart1` to the SVD's `UARTE0`/`UARTE1`:
   Renode's `nrf52840.repl` builds them with `easyDMA: true`, which removes the
   legacy UART's `TXD` register. The test firmware therefore transmits through

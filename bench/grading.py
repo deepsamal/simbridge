@@ -82,6 +82,37 @@ def trace_all(sb, peripheral):
     return sb.call("peripheral_trace", peripheral=peripheral, limit=1_000_000)["accesses"]
 
 
+# Offset of each board's console TX data register, for uart_tx().
+UART_TX_OFFSET = {
+    "stm32f4": 0x04, "stm32f103": 0x04,   # USART DR
+    "stm32f072": 0x28, "stm32l552": 0x28,  # USART TDR
+    "fe310": 0x00, "hifive1": 0x00, "k210": 0x00,  # SiFive txdata
+}
+
+
+def uart_tx(accesses, board):
+    """(t, byte) for every write to the board's UART TX data register, in order.
+    `t` is virtual seconds (at most one quantum early; see time_resolution_s).
+    Not for nrf52840, whose UARTE sends by DMA: its bytes aren't in the trace."""
+    if board not in UART_TX_OFFSET:
+        raise ValueError(f"uart_tx has no TX register for board {board!r}")
+    off = UART_TX_OFFSET[board]
+    return [(a.get("t"), hexint(a["value"]) & 0xFF) for a in accesses
+            if a["op"] == "W" and hexint(a["offset"]) == off]
+
+
+def line_times(tx):
+    """Group uart_tx() output into lines: [(t_of_last_byte, text)], split on \\n."""
+    lines, cur = [], bytearray()
+    for t, b in tx:
+        if b == 0x0A:
+            lines.append((t, cur.decode("ascii", "replace").rstrip("\r")))
+            cur = bytearray()
+        else:
+            cur.append(b)
+    return lines
+
+
 # ---- runner --------------------------------------------------------------------
 
 def load_task_grader(task_dir):

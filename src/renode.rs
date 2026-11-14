@@ -31,6 +31,27 @@ static PROMPT_RE: LazyLock<regex::bytes::Regex> =
     LazyLock::new(|| regex::bytes::Regex::new(r"\r?\(([^()\r\n]+)\) $").unwrap());
 static VT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"Elapsed Virtual Time: (\d+):(\d+):(\d+(?:\.\d+)?)").unwrap());
+/// A log line's leading virtual timestamp, "[HH:MM:SS.nnnnnnnnn]" (ticks are ns).
+/// Host timestamps have 4 decimals, so they never match.
+static TS_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\[(\d+):(\d{2}):(\d{2})\.(\d{9})\] ").unwrap());
+
+/// Renode settings simbridge relies on, passed with `--config` so the user's own
+/// Renode config is never touched: virtual-time log stamps for traces, and no
+/// merging of repeated lines (a polling loop would otherwise collapse to one access).
+const RENODE_CONFIG: &str = "[general]\nlog-timestamps-type = Virtual\ncollapse-repeated-log-entries = false\n";
+
+/// Default global quantum: how often Renode synchronises virtual time, and so
+/// the resolution of trace timestamps. Renode's own default is 100 us.
+const DEFAULT_QUANTUM_US: f64 = 100.0;
+
+fn parse_ts(line: &str) -> Option<f64> {
+    let c = TS_RE.captures(line)?;
+    let (h, m, s): (f64, f64, f64) = (c[1].parse().ok()?, c[2].parse().ok()?, c[3].parse().ok()?);
+    let ns: f64 = c[4].parse().ok()?;
+    Some(((h * 3600.0 + m * 60.0 + s) * 1e9 + ns).round() / 1e9)
+}
+
 static TRACE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(concat!(
         // "[cpu: 0x...]" with one CPU; multi-core platforms name it ("[cpu1: 0x...]").
@@ -249,6 +270,10 @@ pub struct Renode {
     snapshots: BTreeMap<String, Snapshot>,
     term_seq: u32,
     sync_seq: u64,
+    /// Global quantum in seconds, if setting it succeeded (trace timestamp resolution).
+    quantum_s: Option<f64>,
+    /// Virtual time up to which UART output has been handed out (serial / run_until).
+    serial_mark: f64,
 }
 
 impl Renode {
@@ -273,6 +298,8 @@ impl Renode {
             snapshots: BTreeMap::new(),
             term_seq: 0,
             sync_seq: 0,
+            quantum_s: None,
+            serial_mark: 0.0,
         })
     }
 
@@ -291,8 +318,12 @@ impl Renode {
             return Ok(());
         }
         let port = free_port()?;
+        let config = self.workdir.join("renode.config");
+        std::fs::write(&config, RENODE_CONFIG).context("writing Renode config")?;
         let mut cmd = Command::new(&self.renode_path);
         cmd.args(["--disable-xwt", "--plain", "--port", &port.to_string()])
+            .arg("--config")
+            .arg(abs(&config)?)
             // stdout belongs to the MCP transport: Renode must never inherit it.
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -476,6 +507,16 @@ impl Renode {
         self.cmd("Clear")?; // drop all machines (`mach clear` only deselects)
         self.traced.clear();
         self.cmd(&format!("mach create \"{MACHINE}\""))?;
+        // `Clear` resets the emulation, quantum included, so set it per load.
+        let q_us = std::env::var("SIMBRIDGE_QUANTUM_US").ok().and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| *v > 0.0).unwrap_or(DEFAULT_QUANTUM_US);
+        self.quantum_s = match self.cmd(&format!("emulation SetGlobalQuantum \"{:.9}\"", q_us / 1e6)) {
+            Ok(_) => Some(q_us / 1e6),
+            Err(e) => {
+                warnings.push(format!("could not set the global quantum (trace timestamp resolution unknown): {e:#}"));
+                None
+            }
+        };
         self.cmd(&format!("machine LoadPlatformDescription {repl_arg}"))?;
         self.cmd(&format!("sysbus LoadELF {}", q(elf)))?;
         // ApplySVD names registers in traces for regions Renode doesn't model.
@@ -493,6 +534,10 @@ impl Renode {
         self.loaded = Some(loaded);
         self.attach_uart()?;
         info["pc"] = json!(self.pc());
+        self.serial_mark = 0.0;
+        if let Some(q) = self.quantum_s {
+            info["time_resolution_s"] = json!(q);
+        }
         if let Some(d) = svd_dev {
             info["svd_device"] = json!(d.name);
             info["svd_peripherals"] = json!(d.peripherals.len());
@@ -586,6 +631,10 @@ impl Renode {
                 }
             }
         }
+        if re.is_some() {
+            // run_until handed this text out, so serial() starts after it.
+            self.serial_mark = self.virtual_time_s()?.unwrap_or(self.serial_mark);
+        }
         let tail = String::from_utf8_lossy(&text[text.len().saturating_sub(4096)..]).to_string();
         let mut out = json!({"hit": hit.is_some(), "elapsed_virtual_ms": (elapsed * 1e6).round() / 1e6,
                              "steps": steps, "resolution_ms": step_ms, "uart": uart,
@@ -603,8 +652,12 @@ impl Renode {
         if truncated > 0 {
             data.drain(..truncated);
         }
+        // The text was produced between the previous hand-out and now.
+        let t_from = self.serial_mark;
+        let t_to = self.virtual_time_s()?.unwrap_or(t_from);
+        self.serial_mark = t_to;
         Ok(json!({"uart": l.uart, "text": String::from_utf8_lossy(&data), "bytes": data.len(),
-                  "truncated_bytes": truncated + dropped}))
+                  "truncated_bytes": truncated + dropped, "t_from": t_from, "t_to": t_to}))
     }
 
     fn peripheral_range(&mut self, peripheral: &str) -> Result<(u64, u64)> {
@@ -763,10 +816,13 @@ impl Renode {
         let accesses: Vec<Value> = String::from_utf8_lossy(&chunk)
             .lines()
             .filter(|l| tag.is_match(l))
-            .filter_map(|l| TRACE_RE.captures(l))
-            .map(|c| {
+            .filter_map(|l| TRACE_RE.captures(l).map(|c| (parse_ts(l), c)))
+            .map(|(t, c)| {
                 let mut a = json!({"pc": &c[2], "op": &c[3][..1], "width": &c[4], "offset": &c[5],
                                    "reg": c.get(6).map(|m| m.as_str()), "value": &c[7]});
+                if let Some(t) = t {
+                    a["t"] = json!(t); // virtual seconds, at most one quantum early
+                }
                 if &c[1] != "cpu" {
                     a["cpu"] = json!(&c[1]); // which core made the access
                 }
@@ -800,6 +856,9 @@ impl Renode {
             }
         }
         let mut out = json!({"peripheral": short, "total": total, "returned": tail.len(), "accesses": tail});
+        if let Some(q) = self.quantum_s {
+            out["time_resolution_s"] = json!(q);
+        }
         if !synced {
             out["warning"] = json!("Renode's log did not catch up within 10 s; the most recent accesses may be missing");
         }
@@ -837,6 +896,7 @@ impl Renode {
         for p in traced {
             self.enable_trace(&p)?;
         }
+        self.serial_mark = self.virtual_time_s()?.unwrap_or(0.0);
         Ok(json!({"id": id, "load_ms": load_ms, "restore_total_ms": ms(t), "pc": self.pc()}))
     }
 }
@@ -875,5 +935,17 @@ mod tests {
         let two = "[18:38:57.1041]  [INFO] uart: [cpu1: 0x8000030C] WriteUInt32 to 0x0 (TransmitData), value 0x68";
         let c = TRACE_RE.captures(two).unwrap();
         assert_eq!((&c[1], &c[3], &c[5], &c[7]), ("cpu1", "Write", "0x0", "0x68"));
+    }
+}
+
+#[cfg(test)]
+mod ts_tests {
+    use super::parse_ts;
+
+    #[test]
+    fn virtual_timestamps_parse_and_host_ones_dont() {
+        assert_eq!(parse_ts("[00:00:01.000100000] [INFO] usart2: [cpu: 0x8000494] WriteUInt32 ..."), Some(1.0001));
+        assert_eq!(parse_ts("[01:02:03.000000005] x"), Some(3723.000000005));
+        assert_eq!(parse_ts("[18:38:57.1041]  [INFO] uart: ..."), None);
     }
 }

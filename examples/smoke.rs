@@ -75,6 +75,11 @@ async fn main() -> Result<()> {
         let s = call(&client, "serial", json!({})).await?;
         ensure!(s["text"].as_str().unwrap_or("").contains("hello from"), "no banner");
         let t = call(&client, "peripheral_trace", json!({"peripheral": uart, "limit": 2})).await?;
+        // Every access carries a virtual time within the 50 ms just run.
+        ensure!(
+            t["accesses"].as_array().is_some_and(|a| a.iter().all(|x| x["t"].as_f64().is_some_and(|v| v <= 0.0501))),
+            "trace accesses lack virtual timestamps: {t}"
+        );
         ensure!(t["total"].as_u64().unwrap_or(0) > 0, "empty trace");
         let r = call(&client, "regs", json!({"peripheral": uart, "count": 4})).await?;
         ensure!(r["svd_peripheral"] == json!(svd_periph), "regs not matched to SVD: {r}");
@@ -154,6 +159,11 @@ async fn main() -> Result<()> {
     call(&gr, "run_for", json!({"virtual_ms": 1})).await?;
     let t = call(&gr, "peripheral_trace", json!({"peripheral": "usart2", "limit": 1000})).await?;
     ensure!(t["total"].as_u64().unwrap_or(0) > 0 && t.get("warning").is_none(), "trace missed fresh accesses: {t}");
+    let times: Vec<f64> = t["accesses"].as_array().map(|a| a.iter().filter_map(|x| x["t"].as_f64()).collect()).unwrap_or_default();
+    ensure!(!times.is_empty() && times.windows(2).all(|w| w[0] <= w[1]) && times.last() <= Some(&0.0011),
+            "timestamps not ordered within the 1 ms run: {times:?}");
+    let s = call(&gr, "serial", json!({})).await?;
+    ensure!(s["t_from"].as_f64() == Some(0.0) && s["t_to"].as_f64().is_some_and(|v| v > 0.0), "serial window: {s}");
     call(&gr, "run_for", json!({"virtual_ms": 10})).await?;
     let pc = call(&gr, "monitor", json!({"command": "sysbus.cpu PC"})).await?;
     ensure!(pc["output"].as_str().is_some_and(|o| o.contains("0x")), "monitor PC: {pc}");
