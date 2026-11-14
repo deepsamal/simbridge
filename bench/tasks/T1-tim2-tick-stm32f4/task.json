@@ -1,0 +1,10 @@
+{
+  "id": "T1-tim2-tick-stm32f4",
+  "family": "F2",
+  "board": "stm32f4",
+  "target": "thumbv7em-none-eabihf",
+  "package": "t1-firmware",
+  "budget": {"max_iterations": 20, "max_tool_calls": 150, "max_wall_min": 30, "max_tokens": 2000000},
+  "trials": 3,
+  "faults": ["X2-tick-not-volatile", "X3-uif-not-cleared", "X4-psc-off-by-one", "X5-nvic-not-enabled"]
+}

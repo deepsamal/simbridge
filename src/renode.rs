@@ -525,7 +525,8 @@ impl Renode {
             Some(p) => Some(svd::load(p)?),
             None => None,
         };
-        let (repl, repl_arg, uart, cpu) = match crate::presets::find(platform) {
+        let preset = crate::presets::find(platform);
+        let (repl, repl_arg, uart, cpu) = match preset {
             Some(p) => (
                 p.repl.to_string(),
                 format!("@{}", p.repl),
@@ -558,6 +559,15 @@ impl Renode {
             }
         };
         self.cmd(&format!("machine LoadPlatformDescription {repl_arg}"))?;
+        let timer_hz = match preset {
+            Some(p) if !p.timers.is_empty() => {
+                for t in p.timers {
+                    self.cmd(&format!("sysbus.{t} Frequency {}", p.timer_hz))?;
+                }
+                Some(p.timer_hz)
+            }
+            _ => None,
+        };
         self.cmd(&format!("sysbus LoadELF {}", q(elf)))?;
         // ApplySVD names registers in traces for regions Renode doesn't model.
         // Best effort: field decoding in regs()/svd() works without it.
@@ -577,6 +587,10 @@ impl Renode {
         self.serial_mark = 0.0;
         if let Some(q) = self.quantum_s {
             info["time_resolution_s"] = json!(q);
+        }
+        if let Some(hz) = timer_hz {
+            info["timer_clock_hz"] = json!(hz);
+            info["clock_note"] = json!("timers run at the chip's reset clock; Renode does not model RCC/PLL changes");
         }
         if let Some(d) = svd_dev {
             info["svd_device"] = json!(d.name);

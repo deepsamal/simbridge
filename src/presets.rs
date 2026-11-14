@@ -15,7 +15,18 @@ pub struct Preset {
     /// Renode peripheral -> SVD peripheral, where the SVD has several views at
     /// one address and the platform's model matches a specific one.
     pub svd_alias: &'static [(&'static str, &'static str)],
+    /// Timers to clock at `timer_hz`. Renode's STM32 platforms clock every timer
+    /// at a fixed 10 MHz; the chip's timers run from its reset clock until the
+    /// firmware reprograms RCC, so firmware correct on hardware is only correct
+    /// here at the reset clock. (Renode doesn't follow RCC changes.)
+    pub timers: &'static [&'static str],
+    pub timer_hz: u64,
 }
+
+const STM32_TIMERS_1_14: &[&str] = &[
+    "timer1", "timer2", "timer3", "timer4", "timer5", "timer6", "timer7",
+    "timer8", "timer9", "timer10", "timer11", "timer12", "timer13", "timer14",
+];
 
 pub const PRESETS: &[Preset] = &[
     Preset {
@@ -25,6 +36,8 @@ pub const PRESETS: &[Preset] = &[
         cpu: "sysbus.cpu",
         svd: "cmsis-svd-data/data/STMicro/STM32F407.svd",
         svd_alias: &[],
+        timers: STM32_TIMERS_1_14,
+        timer_hz: 16_000_000,
     },
     Preset {
         names: &["fe310", "hifive1"],
@@ -33,6 +46,8 @@ pub const PRESETS: &[Preset] = &[
         cpu: "sysbus.cpu",
         svd: "e310x/e310x/e310x.svd",
         svd_alias: &[],
+        timers: &[],
+        timer_hz: 0,
     },
     Preset {
         names: &["nrf52840"],
@@ -42,6 +57,8 @@ pub const PRESETS: &[Preset] = &[
         svd: "cmsis-svd-data/data/Nordic/nrf52840.svd",
         // Renode's nrf52840.repl builds both UARTs with easyDMA: true.
         svd_alias: &[("uart0", "UARTE0"), ("uart1", "UARTE1")],
+        timers: &[],
+        timer_hz: 0,
     },
     Preset {
         names: &["stm32f103", "bluepill"],
@@ -50,6 +67,8 @@ pub const PRESETS: &[Preset] = &[
         cpu: "sysbus.cpu",
         svd: "cmsis-svd-data/data/STMicro/STM32F103xx.svd",
         svd_alias: &[],
+        timers: STM32_TIMERS_1_14,
+        timer_hz: 8_000_000,
     },
     Preset {
         names: &["stm32f072"],
@@ -58,6 +77,8 @@ pub const PRESETS: &[Preset] = &[
         cpu: "sysbus.cpu",
         svd: "cmsis-svd-data/data/STMicro/STM32F072x.svd",
         svd_alias: &[],
+        timers: &[],
+        timer_hz: 0,
     },
     Preset {
         names: &["stm32l552"],
@@ -66,6 +87,8 @@ pub const PRESETS: &[Preset] = &[
         cpu: "sysbus.cpu",
         svd: "cmsis-svd-data/data/STMicro/STM32L552.svd",
         svd_alias: &[],
+        timers: &["timer1", "timer2", "timer3", "timer4", "timer5", "timer6", "timer7", "timer8", "timer15", "timer16", "timer17"],
+        timer_hz: 4_000_000,
     },
     Preset {
         names: &["k210", "kendryte_k210"],
@@ -74,6 +97,8 @@ pub const PRESETS: &[Preset] = &[
         cpu: "sysbus.cpu1",
         svd: "cmsis-svd-data/data/Kendryte-Community/k210.svd",
         svd_alias: &[],
+        timers: &[],
+        timer_hz: 0,
     },
 ];
 

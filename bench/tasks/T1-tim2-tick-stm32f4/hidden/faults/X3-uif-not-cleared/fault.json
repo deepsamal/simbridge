@@ -1,0 +1,10 @@
+{
+  "id": "X3",
+  "class": "missing_flag_clear",
+  "peripheral": "TIM2",
+  "register": "SR",
+  "field": "UIF",
+  "location": "src/main.rs:33",
+  "description": "The TIM2 handler never clears SR.UIF, so the interrupt stays pending and re-enters immediately: TICKS counts at instruction speed and main() is starved.",
+  "symptom": "Board appears hung after T1 start."
+}

@@ -311,6 +311,16 @@ The first call also pays Renode's cold start, about 1–5 s.
   the STM32 USART model always reports TXE = 1, and on the nRF52840 only the
   EasyDMA UART (UARTE) is modeled. Passing in simulation doesn't prove the
   firmware works on hardware.
+- **Timers run at the reset clock.** Renode's STM32 platforms clock every timer
+  at a fixed 10 MHz and don't follow RCC/PLL changes. The STM32 presets set the
+  timers to the chip's reset clock instead (F4: 16 MHz HSI, F103: 8 MHz HSI,
+  L552: 4 MHz MSI; `load` reports `timer_clock_hz`), so firmware that keeps the
+  reset clock times correctly. Firmware that switches to the PLL will not.
+- **STM32 timer period is one count short.** Renode's `STM32_Timer` reloads
+  after ARR counts instead of ARR + 1, so update interrupts come 1/ARR fast
+  (0.1% at ARR = 999), and firmware with ARR off by one (1000 for a 1 kHz tick
+  from 1 MHz) looks exact. Graders check timer rates from PSC/ARR with the
+  hardware formula as well as by measurement.
 - **Not cycle-accurate.** Virtual time is deterministic but not cycle-exact, and
   there's no analog, RF or sensor physics.
 - **Renode's boards only.** A chip without a Renode platform can't be run. For

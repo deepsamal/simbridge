@@ -1,0 +1,10 @@
+{
+  "id": "X5",
+  "class": "missing_enable",
+  "peripheral": "NVIC",
+  "register": "ISER0",
+  "field": "TIM2 (IRQ 28)",
+  "location": "src/main.rs:83",
+  "description": "TIM2's update interrupt is enabled in DIER but never unmasked in the NVIC, so the handler never runs.",
+  "symptom": "Prints T1 start, then nothing; TICKS stays 0."
+}

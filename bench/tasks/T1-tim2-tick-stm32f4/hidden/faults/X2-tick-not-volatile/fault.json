@@ -1,0 +1,10 @@
+{
+  "id": "X2",
+  "class": "concurrency_compiler",
+  "peripheral": "TIM2",
+  "register": null,
+  "field": null,
+  "location": "src/main.rs:39",
+  "description": "main() reads TICKS with a plain load instead of read_volatile. The compiler sees no write in the loop and hoists the load, so the wait for the next 1000 ticks never ends even though the interrupt keeps counting.",
+  "symptom": "Prints T1 start, then no count lines; TICKS keeps increasing."
+}

@@ -67,3 +67,4 @@ A result looks like:
 | id | family | board | seeded faults |
 |---|---|---|---|
 | B1-uart-banner-stm32f4 | F1 bring-up | stm32f4 | X1: polls RXNE instead of TXE |
+| T1-tim2-tick-stm32f4 | F2 timers & interrupts | stm32f4 | X2: tick read not volatile; X3: UIF not cleared; X4: PSC 16 not 15; X5: NVIC not enabled |

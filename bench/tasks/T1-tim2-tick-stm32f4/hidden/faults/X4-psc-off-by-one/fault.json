@@ -1,0 +1,10 @@
+{
+  "id": "X4",
+  "class": "configuration_arithmetic",
+  "peripheral": "TIM2",
+  "register": "PSC",
+  "field": null,
+  "location": "src/main.rs:78",
+  "description": "PSC = 16 instead of 15: the counter runs at 16 MHz / 17 = 941 kHz, so updates come at 941 Hz instead of 1 kHz.",
+  "symptom": "Count lines drift slower than 1 s (about 1.06 s apart)."
+}
