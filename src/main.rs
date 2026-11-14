@@ -119,6 +119,10 @@ struct TraceArgs {
     disable: Option<bool>,
     /// Decode each access value into SVD register fields.
     decode: Option<bool>,
+    /// Keep only reads ("R") or writes ("W").
+    op: Option<String>,
+    /// Keep only accesses at this register offset (number or "0x..." string).
+    offset: Option<Value>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -374,14 +378,18 @@ impl SimBridge {
 
     #[tool(description = "Bus accesses to a peripheral (via `sysbus LogPeripheralAccess`) \
         logged since the previous call: pc, op (R/W), offset, register name, value. The first \
-        call enables tracing and returns nothing; run_for, then call again.")]
+        call enables tracing and returns nothing; run_for, then call again. `total` counts \
+        every matching access; only the last `limit` are returned. Filter with op/offset \
+        (e.g. op=\"W\", offset=\"0x4\") rather than raising limit.")]
     async fn peripheral_trace(&self, Parameters(a): Parameters<TraceArgs>) -> String {
         self.call(move |r| {
+            let filter = renode::TraceFilter::parse(a.op.as_deref(), a.offset.as_ref())?;
             r.peripheral_trace(
                 &a.peripheral,
                 a.limit.unwrap_or(50),
                 a.disable.unwrap_or(false),
                 a.decode.unwrap_or(false),
+                &filter,
             )
         })
         .await

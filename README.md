@@ -211,6 +211,27 @@ tool over real MCP stdio on every preset board. It checks:
 If an MCP client is currently running the server, Windows locks the binary and
 the rebuild step fails, so close the client first.
 
+### Split build/run loop (Linux)
+
+Building and running can happen on different machines: `scripts/vm/` builds
+Linux binaries and task ELFs where cargo is, and runs the smoke test and task
+validation where Renode is. This is how Claude tests changes without the
+developer re-running everything on Windows. The scripts expect a Linux VM that
+mounts this repo at `~/mnt/agentic-embedded-rust/simbridge`; edit
+`scripts/vm/env.sh` for other layouts.
+
+```bash
+scripts/vm/build.sh     # build side: Linux simbridge + smoke (glibc 2.35, via cargo-zigbuild)
+                        #   and task ELFs (validate.py --build-only), into target/loop/
+scripts/vm/setup.sh     # run side, once per VM: Renode 1.17.0 + copy the binaries out of the mount
+scripts/vm/smoke.sh     # all boards, or name some
+scripts/vm/validate.sh  # grade the prebuilt task ELFs (validate.py --prebuilt)
+```
+
+Linux is the second platform, not a replacement: Windows-specific code (the
+kill-on-close job object, path handling, file sharing on the Renode log) only
+runs on Windows, so re-run the Windows smoke test at milestones.
+
 `cargo test` runs the unit tests: the SVD parser and decoder, plus trace-line
 parsing. Set `SIMBRIDGE_TEST_SVD_DIR` to a folder of `.svd` files to also check
 that each of them parses.
@@ -307,9 +328,15 @@ The first call also pays Renode's cold start, about 1–5 s.
   merging of repeated log lines, which would otherwise collapse a polling loop
   into one access. Each timestamp is the virtual time of the last quantum
   boundary, so an access is stamped up to one quantum (100 us by default) early.
+  Renode 1.16.0 ignores that setting and writes wall-clock times; simbridge then
+  returns accesses without `t` and says so in a warning. Use Renode 1.17 or newer.
 - Renode writes its log file in the background: simbridge starts it with
   flush-after-every-write and, before each trace read, logs a unique sync line
   and waits for it, so a read never misses the latest accesses.
+- A firmware spinning on a status register logs millions of accesses. Trace
+  reads stream the log line by line and keep only the newest `limit` matches,
+  so memory stays flat; graders filter server-side with `op`/`offset` (e.g.
+  every write to the data register) rather than pulling every poll.
 - The nRF52840 preset maps `uart0`/`uart1` to the SVD's `UARTE0`/`UARTE1`:
   Renode's `nrf52840.repl` builds them with `easyDMA: true`, which removes the
   legacy UART's `TXD` register. The test firmware therefore transmits through
@@ -350,6 +377,7 @@ src/calllog.rs       SIMBRIDGE_TOOLS allowlist and SIMBRIDGE_LOG call log
 examples/smoke.rs    end-to-end test over MCP stdio, all boards
 firmware/            per-board hello firmware + common/hello.rs
 bench/               simbridge-bench: grading client, task format, validator, tasks
+scripts/vm/          split build/run test loop for a Linux VM
 python/              the first prototype in Python, kept for reference
 ```
 

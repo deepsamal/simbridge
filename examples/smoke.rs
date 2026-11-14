@@ -27,16 +27,25 @@ async fn call(c: &RunningService<RoleClient, ()>, name: &'static str, args: Valu
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    // `cargo run --example smoke` builds only this example, never the server
-    // binary it drives, so build that first or we'd test a stale simbridge.
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-    let status = std::process::Command::new(cargo)
-        .args(["build", "--release", "--bin", "simbridge"])
-        .current_dir(&root)
-        .status()?;
-    ensure!(status.success(), "building simbridge failed");
-    let exe = root.join("target/release/simbridge").with_extension(std::env::consts::EXE_EXTENSION);
+    // SIMBRIDGE_ROOT / SIMBRIDGE_EXE let a prebuilt smoke run against a prebuilt
+    // server on another machine (the Linux VM loop); otherwise build from source.
+    let root = std::env::var_os("SIMBRIDGE_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+    let exe = match std::env::var_os("SIMBRIDGE_EXE") {
+        Some(p) => PathBuf::from(p),
+        None => {
+            // `cargo run --example smoke` builds only this example, never the server
+            // binary it drives, so build that first or we'd test a stale simbridge.
+            let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+            let status = std::process::Command::new(cargo)
+                .args(["build", "--release", "--bin", "simbridge"])
+                .current_dir(&root)
+                .status()?;
+            ensure!(status.success(), "building simbridge failed");
+            root.join("target/release/simbridge").with_extension(std::env::consts::EXE_EXTENSION)
+        }
+    };
     // The main pass needs every tool and no log, whatever the caller's environment says.
     let mut cmd = tokio::process::Command::new(&exe);
     cmd.env_remove("SIMBRIDGE_TOOLS").env_remove("SIMBRIDGE_LOG").env_remove("SIMBRIDGE_MODE");

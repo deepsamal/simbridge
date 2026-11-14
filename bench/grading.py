@@ -77,9 +77,12 @@ def reg_value(sb, peripheral, register):
     raise SimBridgeError(f"{peripheral}.{register} not decoded (is the SVD loaded?)")
 
 
-def trace_all(sb, peripheral):
-    """Every access logged since tracing was enabled or last read."""
-    return sb.call("peripheral_trace", peripheral=peripheral, limit=1_000_000)["accesses"]
+def trace_all(sb, peripheral, op=None, offset=None):
+    """Every access logged since tracing was enabled or last read, optionally only
+    reads/writes (op="R"/"W") at one register offset. Filter here rather than in
+    Python: a firmware spinning on a status register logs millions of reads."""
+    args = {k: v for k, v in (("op", op), ("offset", offset)) if v is not None}
+    return sb.call("peripheral_trace", peripheral=peripheral, limit=1_000_000, **args)["accesses"]
 
 
 # Offset of each board's console TX data register, for uart_tx().

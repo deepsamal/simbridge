@@ -1,8 +1,8 @@
 //! Blocking client for a headless Renode instance driven through its monitor socket.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -44,6 +44,46 @@ const RENODE_CONFIG: &str = "[general]\nlog-timestamps-type = Virtual\ncollapse-
 /// Default global quantum: how often Renode synchronises virtual time, and so
 /// the resolution of trace timestamps. Renode's own default is 100 us.
 const DEFAULT_QUANTUM_US: f64 = 100.0;
+
+/// Server-side filter for peripheral_trace, so a grader can ask for "every write
+/// to DR" without pulling millions of status-register polls through MCP.
+#[derive(Debug, Default)]
+pub struct TraceFilter {
+    op: Option<char>,
+    offset: Option<u64>,
+}
+
+impl TraceFilter {
+    pub fn parse(op: Option<&str>, offset: Option<&Value>) -> Result<Self> {
+        let op = match op.map(|s| s.trim().to_ascii_uppercase()) {
+            None => None,
+            Some(s) if s == "R" || s == "READ" => Some('R'),
+            Some(s) if s == "W" || s == "WRITE" => Some('W'),
+            Some(s) => bail!("op must be \"R\" or \"W\", not {s:?}"),
+        };
+        let offset = match offset {
+            None | Some(Value::Null) => None,
+            Some(Value::Number(n)) => Some(n.as_u64().ok_or_else(|| anyhow!("bad offset {n}"))?),
+            Some(Value::String(s)) => Some(parse_hex(s)?),
+            Some(v) => bail!("offset must be a number or \"0x...\" string, not {v}"),
+        };
+        Ok(Self { op, offset })
+    }
+
+    fn matches(&self, op: &str, offset: &str, base: Option<u64>) -> bool {
+        if self.op.is_some_and(|o| !op.starts_with(o)) {
+            return false;
+        }
+        match self.offset {
+            None => true,
+            Some(want) => match parse_hex(offset) {
+                // Trace offsets may be absolute on some Renode versions.
+                Ok(off) => (match base { Some(b) if off >= b => off - b, _ => off }) == want,
+                Err(_) => false,
+            },
+        }
+    }
+}
 
 fn parse_ts(line: &str) -> Option<f64> {
     let c = TS_RE.captures(line)?;
@@ -768,39 +808,51 @@ impl Renode {
         Ok(())
     }
 
-    /// Read the log from `start` up to a sync point. Renode's logger hands entries
-    /// to a background thread, so the file can lag the simulation slightly. We log
-    /// a unique line with the monitor's `log` command and wait for it: entries go
-    /// through one ordered queue, so once it's in the file, every access logged
-    /// before it is too. Returns the bytes before the sync line, how many bytes to
-    /// consume (through the sync line), and whether it appeared within the timeout.
-    fn read_log_synced(&mut self, start: u64) -> Result<(Vec<u8>, u64, bool)> {
+    /// Stream the log from `start` up to a sync point, one complete line at a time.
+    /// Renode's logger hands entries to a background thread, so the file can lag
+    /// the simulation. We log a unique line with the monitor's `log` command and
+    /// read until it appears: entries go through one ordered queue, so every access
+    /// logged before it is in the file by then. Lines are streamed, never buffered
+    /// whole: a firmware spinning on a status register logs millions of them.
+    /// Returns the bytes consumed (through the sync line) and whether it appeared;
+    /// gives up after 10 s with no new data.
+    fn scan_log_synced(&mut self, start: u64, mut on_line: impl FnMut(&str)) -> Result<(u64, bool)> {
         self.sync_seq += 1;
         let token = format!("simbridge-sync-{}", self.sync_seq);
         let marker = Regex::new(&format!(r"{}\b", regex::escape(&token)))?;
         self.cmd(&format!("log \"{token}\""))?;
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // std opens with FILE_SHARE_READ|WRITE on Windows, so Renode can keep writing.
+        let mut f = File::open(&self.log_path)?;
+        f.seek(SeekFrom::Start(start))?;
+        let mut f = BufReader::with_capacity(1 << 20, f);
+        let (mut consumed, mut line) = (0u64, Vec::new());
+        let mut deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            let mut buf = Vec::new();
-            let mut f = File::open(&self.log_path)?; // std opens with FILE_SHARE_READ|WRITE on Windows
-            f.seek(SeekFrom::Start(start))?;
-            f.read_to_end(&mut buf)?;
-            let text = String::from_utf8_lossy(&buf);
-            if let Some(m) = marker.find(&text) {
-                // Accesses end where the sync line starts; consume through its newline.
-                let line_start = text[..m.start()].rfind('\n').map(|i| i + 1).unwrap_or(0);
-                let line_end = text[m.end()..].find('\n').map(|i| m.end() + i + 1).unwrap_or(text.len());
-                return Ok((text.as_bytes()[..line_start].to_vec(), line_end as u64, true));
+            let n = f.read_until(b'\n', &mut line)?;
+            if n > 0 {
+                deadline = Instant::now() + Duration::from_secs(10);
             }
+            if line.last() == Some(&b'\n') {
+                consumed += line.len() as u64;
+                let text = String::from_utf8_lossy(&line);
+                if marker.is_match(&text) {
+                    return Ok((consumed, true));
+                }
+                on_line(text.trim_end_matches(['\r', '\n']));
+                line.clear();
+                continue;
+            }
+            // At end of file, possibly mid-line: wait for the writer to catch up.
             if Instant::now() > deadline {
-                return Ok((buf.clone(), buf.len() as u64, false));
+                return Ok((consumed, false));
             }
             thread::sleep(Duration::from_millis(10));
         }
     }
 
     /// Accesses logged since the previous call (the first call enables tracing).
-    pub fn peripheral_trace(&mut self, peripheral: &str, limit: usize, disable: bool, decode: bool) -> Result<Value> {
+    pub fn peripheral_trace(&mut self, peripheral: &str, limit: usize, disable: bool, decode: bool,
+                            filter: &TraceFilter) -> Result<Value> {
         self.require_loaded()?;
         let short = Self::short(peripheral).to_string();
         if !self.traced.contains(&short) {
@@ -808,35 +860,46 @@ impl Renode {
             return Ok(json!({"peripheral": short, "enabled": true, "accesses": [], "total": 0,
                              "note": "tracing enabled; run_for() then call again"}));
         }
+        let base = self.peripheral_range(&short).ok().map(|r| r.0);
         let start = *self.log_offsets.get(&short).unwrap_or(&0);
-        let (chunk, consumed, synced) = self.read_log_synced(start)?;
-        self.log_offsets.insert(short.clone(), start + consumed);
         // Renode tags lines "usart2:" with one machine, "sb/usart2:" with several.
         let tag = Regex::new(&format!(r"[\] /]{}: \[cpu\w*:", regex::escape(&short)))?;
-        let accesses: Vec<Value> = String::from_utf8_lossy(&chunk)
-            .lines()
-            .filter(|l| tag.is_match(l))
-            .filter_map(|l| TRACE_RE.captures(l).map(|c| (parse_ts(l), c)))
-            .map(|(t, c)| {
-                let mut a = json!({"pc": &c[2], "op": &c[3][..1], "width": &c[4], "offset": &c[5],
-                                   "reg": c.get(6).map(|m| m.as_str()), "value": &c[7]});
-                if let Some(t) = t {
-                    a["t"] = json!(t); // virtual seconds, at most one quantum early
-                }
-                if &c[1] != "cpu" {
-                    a["cpu"] = json!(&c[1]); // which core made the access
-                }
-                a
-            })
-            .collect();
-        let total = accesses.len();
+        // Keep only the newest `limit` matches; count the rest.
+        let (mut kept, mut total, mut untimed) = (VecDeque::with_capacity(limit.min(4096)), 0usize, 0usize);
+        let (consumed, synced) = self.scan_log_synced(start, |l| {
+            if !tag.is_match(l) {
+                return;
+            }
+            let Some(c) = TRACE_RE.captures(l) else { return };
+            if !filter.matches(&c[3][..1], &c[5], base) {
+                return;
+            }
+            total += 1;
+            let t = parse_ts(l);
+            untimed += t.is_none() as usize;
+            if limit == 0 {
+                return;
+            }
+            if kept.len() == limit {
+                kept.pop_front();
+            }
+            let mut a = json!({"pc": &c[2], "op": &c[3][..1], "width": &c[4], "offset": &c[5],
+                               "reg": c.get(6).map(|m| m.as_str()), "value": &c[7]});
+            if let Some(t) = t {
+                a["t"] = json!(t); // virtual seconds, at most one quantum early
+            }
+            if &c[1] != "cpu" {
+                a["cpu"] = json!(&c[1]); // which core made the access
+            }
+            kept.push_back(a);
+        })?;
+        self.log_offsets.insert(short.clone(), start + consumed);
         if disable {
             self.cmd(&format!("sysbus LogPeripheralAccess sysbus.{short} false"))?;
             self.traced.remove(&short);
         }
-        let mut tail = accesses[total.saturating_sub(limit)..].to_vec();
+        let mut tail: Vec<Value> = kept.into();
         if decode {
-            let base = self.peripheral_range(&short).ok().map(|r| r.0);
             if let Some(dev) = self.svd_device()? {
                 let name = self.require_loaded()?.svd_name(&short).to_string();
                 if let Some(sp) = dev.find(&name, base) {
@@ -859,8 +922,16 @@ impl Renode {
         if let Some(q) = self.quantum_s {
             out["time_resolution_s"] = json!(q);
         }
+        let mut warnings = Vec::new();
         if !synced {
-            out["warning"] = json!("Renode's log did not catch up within 10 s; the most recent accesses may be missing");
+            warnings.push("Renode's log did not catch up within 10 s; the most recent accesses may be missing");
+        }
+        if untimed > 0 {
+            // Seen with Renode 1.16.0, which ignores log-timestamps-type = Virtual.
+            warnings.push("Renode wrote wall-clock, not virtual, log timestamps, so accesses have no `t`; use Renode 1.17 or newer");
+        }
+        if !warnings.is_empty() {
+            out["warning"] = json!(warnings.join("; "));
         }
         Ok(out)
     }

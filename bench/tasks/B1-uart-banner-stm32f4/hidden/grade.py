@@ -23,7 +23,7 @@ def grade(sb, elf, g):
 
     # 3. The text really went through USART2's data register, byte for byte.
     #    (Read the trace before regs() so model reads never mix into it.)
-    writes = [a for a in trace_all(sb, "usart2") if a["op"] == "W" and hexint(a["offset"]) == 0x4]
+    writes = trace_all(sb, "usart2", op="W", offset=0x4)
     sent = bytes(hexint(a["value"]) & 0xFF for a in writes)
     g.check("dr_writes", sent == BANNER, detail={"dr_bytes": sent.decode("ascii", "replace")[:200]})
 
