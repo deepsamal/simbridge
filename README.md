@@ -18,6 +18,15 @@ guidance that makes agents good at embedded work: skills and instructions for
 tasks such as looking up registers in an SVD instead of guessing bit positions,
 and a benchmark that measures which of them actually help.
 
+| part | where | status |
+|---|---|---|
+| simbridge, the MCP server | `src/`, this README | 7 boards; everything the benchmark's first run needs |
+| Skills | [`skills/`](skills/README.md) | `svd-registers` |
+| simbridge-bench | [`bench/`](bench/README.md), design in [`docs/design.md`](docs/design.md) | tasks B1 and T1 built and validated; agent runner not built yet |
+
+New here? Set up with the [Quick start](#quick-start), then read
+[CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow.
+
 ### Where firmware-in-the-loop fits
 
 | stage | what runs | what it's simulated against | catches |
@@ -79,10 +88,24 @@ snapshot()  ...  restore(id="s1")      -> virtual time and RAM back where they w
 
 ### 1. Requirements
 
-- [Renode](https://renode.io) 1.17. On Windows the installer puts it at
-  `C:\Program Files\Renode\renode.exe`, which simbridge finds on its own.
-  Otherwise put it on `PATH` or set `SIMBRIDGE_RENODE`.
-- Rust stable (tested on 1.94).
+- [Renode](https://renode.io) **1.17 or newer** (1.16 writes wall-clock log
+  timestamps, so traces lose their virtual time). Windows: the installer puts it
+  at `C:\Program Files\Renode\renode.exe`, which simbridge finds on its own.
+  Linux: unpack the `linux-portable` release from
+  [GitHub](https://github.com/renode/renode/releases) and put `renode` on
+  `PATH`, or set `SIMBRIDGE_RENODE`. macOS: the `.dmg` release; set
+  `SIMBRIDGE_RENODE` to the `renode` binary inside the app (untested).
+- [Rust](https://rustup.rs) stable (tested on 1.94 and 1.97), plus the
+  firmware targets if you'll build firmware (the smoke test and the benchmark
+  tasks do):
+
+  ```bash
+  rustup target add thumbv6m-none-eabi thumbv7m-none-eabi thumbv7em-none-eabihf \
+    thumbv8m.main-none-eabihf riscv32imac-unknown-none-elf riscv64imac-unknown-none-elf
+  ```
+- Python 3.8 or newer for the benchmark scripts in `bench/` (standard library
+  only, nothing to install).
+- git, for the SVD repositories below.
 
 ### 2. Build
 
@@ -112,11 +135,36 @@ everything still works except field decoding: `load` returns a warning and
 
 ### 4. Register it with your agent
 
+simbridge is a stdio MCP server: the client starts the binary and talks to it
+over stdin/stdout. Any setting from [Configuration](#configuration) can be
+passed as an environment variable in the client's config.
+
 Claude Code:
 
 ```bash
 claude mcp add simbridge -- /path/to/simbridge/target/release/simbridge
+# with settings, e.g.:
+claude mcp add simbridge -e SIMBRIDGE_SVD_DIR=/path/to/svd -- /path/to/simbridge/target/release/simbridge
 ```
+
+OpenCode (`opencode.json` in the project, or `~/.config/opencode/opencode.json`):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "simbridge": {
+      "type": "local",
+      "command": ["/path/to/simbridge/target/release/simbridge"],
+      "enabled": true,
+      "environment": { "SIMBRIDGE_SVD_DIR": "/path/to/svd" }
+    }
+  }
+}
+```
+
+That is OpenCode's V1 config format; V2 moves servers under `mcp.servers`
+(see [OpenCode's MCP docs](https://opencode.ai/docs/mcp-servers)).
 
 Claude Desktop (**Settings → Developer → Edit Config**, then fully quit and
 reopen the app):
@@ -133,7 +181,9 @@ reopen the app):
 ```
 
 `claude mcp add` only registers the server with Claude Code; Claude Desktop
-reads its own config file. Then ask something like: *"Load
+reads its own config file. On Windows, a running client keeps
+`simbridge.exe` locked, so `cargo build` can't replace it until the client is
+closed. Then ask something like: *"Load
 firmware/stm32f4-hello's release ELF on stm32f4, run 50 ms, and show the
 serial output and the decoded USART2 status register."*
 
@@ -144,7 +194,7 @@ time after the call) and `wall_ms` (the host time the call took).
 
 | tool | what it does |
 |---|---|
-| `load(elf, platform="stm32f4", uart?, cpu?, svd?)` | Creates a fresh machine and loads the ELF. `platform` is a preset (table below) or a `.repl` path, which then needs `uart` (and `cpu` if it isn't `sysbus.cpu`). `svd` overrides the preset's SVD (a path, a preset name, or `"none"`); it's parsed once, cached, and also given to Renode with `ApplySVD`. |
+| `load(elf, platform="stm32f4", uart?, cpu?, svd?)` | Creates a fresh machine and loads the ELF. `platform` is a preset (table below) or a `.repl` path, which then needs `uart` (and `cpu` if it isn't `sysbus.cpu`). `svd` overrides the preset's SVD (a path, a preset name, or `"none"`); it's parsed once, cached, and also given to Renode with `ApplySVD`. Returns the PC, `time_resolution_s`, the SVD device, `timer_clock_hz` on STM32 presets (see Limits) and any `warnings`. |
 | `reset()` | Rebuilds the machine and reloads the same ELF, so virtual time goes back to 0. Traces stay enabled. |
 | `run_for(virtual_ms)` | Advances exactly that much virtual time, then pauses. Returns the PC. |
 | `run_until(uart_regex?, mem_addr?, mem_equals?, timeout_ms=1000, step_ms=1)` | Runs in `step_ms` slices until UART output matches the regex, or until the 32-bit word at `mem_addr` (address or ELF symbol) equals `mem_equals`, or until the timeout. Returns `hit`, `stop` (the reason), `elapsed_virtual_ms` and the UART text it saw. That text is consumed, so `serial()` won't return it again. The stop time is accurate to one step, and each step costs about 15–25 ms of wall time. |
@@ -152,8 +202,9 @@ time after the call) and `wall_ms` (the host time the call took).
 | `regs(peripheral, count=8, offset=0, register?, verbose=false)` | Reads 32-bit words from a peripheral's bus window. With an SVD, each word is decoded into its register(s) and fields (bit range, value, matching enum name); `register="SR"` reads one register by name, `verbose` adds descriptions. The Renode peripheral is matched to the SVD by base address, so `gpioPortA` finds `GPIOA`. These are model reads, so registers with read side effects are affected (flagged as `read_side_effect` when the SVD says so). |
 | `svd(svd?, peripheral?, register?, value?, query?, limit=40)` | SVD lookup that doesn't touch the simulator. No arguments: list peripherals. `peripheral`: its registers. `peripheral` + `register`: every field with bits, access, description and enumerated values; add `value` to decode a number. `query`: regex search over names and descriptions. Uses the loaded machine's SVD unless `svd` names a path or preset. |
 | `mem(addr, length=64)` | Reads up to 1 KiB. `addr` can be a number, a `"0x..."` string or an ELF symbol such as `"TICKS"`. |
-| `peripheral_trace(peripheral, limit=50, disable=false, decode=false)` | The first call turns on `LogPeripheralAccess`. Later calls return the accesses since the previous call: PC, R/W, offset, register name and value, the virtual time `t` in seconds, plus the CPU on multi-core boards. `time_resolution_s` gives the timestamp resolution (see Notes). `decode` adds the SVD field breakdown of each value. |
+| `peripheral_trace(peripheral, limit=50, disable=false, decode=false, op?, offset?)` | The first call turns on `LogPeripheralAccess`. Later calls return the accesses since the previous call: PC, R/W, offset, register name and value, the virtual time `t` in seconds, plus the CPU on multi-core boards. `total` counts every matching access; only the newest `limit` are returned. `op` (`"R"`/`"W"`) and `offset` (e.g. `"0x4"`) filter on the server, so "every write to DR" doesn't pull a million status polls. `time_resolution_s` gives the timestamp resolution (see Notes). `decode` adds the SVD field breakdown of each value. |
 | `snapshot()` / `restore(id)` | Renode `Save` / `Load` of the full state. Each reports how long it took. |
+| `monitor(command)` | **Grader mode only** (`SIMBRIDGE_MODE=grader`): one raw Renode monitor command. Never exposed to agents. |
 
 ## Board presets
 
@@ -180,8 +231,10 @@ Any other Renode platform works without a preset: pass a `.repl` path as
 
 Presets are one table in `src/presets.rs`. Each entry gives the Renode
 platform, the console UART, the CPU to report, the SVD's path relative to the
-SVD folder, and optional `svd_alias` entries for when the SVD has several views
-at one address and the Renode model matches a specific one. To have the smoke
+SVD folder, optional `svd_alias` entries for when the SVD has several views
+at one address and the Renode model matches a specific one, and, for chips
+whose Renode timers don't run at the chip's reset clock, the timers to reclock
+(`timers`, `timer_hz`). To have the smoke
 test cover the new board, add a `firmware/<board>-hello` crate and an entry in
 `examples/smoke.rs`. The existing hello crates are about 40 lines each and share
 their banner and tick loop through `firmware/common/hello.rs`.
@@ -200,7 +253,8 @@ In PowerShell, the firmware loop is:
 `Get-ChildItem firmware -Directory -Filter *-hello | % { Push-Location $_; cargo build --release; Pop-Location }`
 
 `examples/smoke.rs` rebuilds the server binary, spawns it, and drives every
-tool over real MCP stdio on every preset board. It checks:
+tool over real MCP stdio on every preset board. It needs the SVDs from
+[step 3](#3-get-the-svds-optional-for-register-decoding). It checks:
 
 - the UART banner;
 - that the trace isn't empty;
@@ -211,9 +265,27 @@ tool over real MCP stdio on every preset board. It checks:
 If an MCP client is currently running the server, Windows locks the binary and
 the rebuild step fails, so close the client first.
 
+### Unit tests
+
+`cargo test` runs the unit tests: the SVD parser and decoder, plus trace-line
+parsing. Set `SIMBRIDGE_TEST_SVD_DIR` to a folder of `.svd` files to also check
+that each of them parses.
+
+### Benchmark tasks
+
+```bash
+python bench/validate.py      # every task: reference must pass, every seeded fault must fail
+```
+
+See [`bench/README.md`](bench/README.md) for grading one ELF and the task
+format. The first run builds each task variant's dependencies, which takes a
+few minutes.
+
 ### Split build/run loop (Linux)
 
-Building and running can happen on different machines: `scripts/vm/` builds
+On an ordinary Linux machine with Rust and Renode installed you don't need
+this: the commands above work as they are. Building and running can also
+happen on different machines: `scripts/vm/` builds
 Linux binaries and task ELFs where cargo is, and runs the smoke test and task
 validation where Renode is. This is how Claude tests changes without the
 developer re-running everything on Windows. The scripts expect a Linux VM that
@@ -231,10 +303,6 @@ scripts/vm/validate.sh  # grade the prebuilt task ELFs (validate.py --prebuilt)
 Linux is the second platform, not a replacement: Windows-specific code (the
 kill-on-close job object, path handling, file sharing on the Renode log) only
 runs on Windows, so re-run the Windows smoke test at milestones.
-
-`cargo test` runs the unit tests: the SVD parser and decoder, plus trace-line
-parsing. Set `SIMBRIDGE_TEST_SVD_DIR` to a folder of `.svd` files to also check
-that each of them parses.
 
 ## Configuration
 
@@ -387,6 +455,8 @@ src/calllog.rs       SIMBRIDGE_TOOLS allowlist and SIMBRIDGE_LOG call log
 examples/smoke.rs    end-to-end test over MCP stdio, all boards
 firmware/            per-board hello firmware + common/hello.rs
 bench/               simbridge-bench: grading client, task format, validator, tasks
+skills/              agent skills (svd-registers), kept out of auto-discovery
+docs/design.md       simbridge-bench design: task families, conditions, metrics, roadmap
 scripts/vm/          split build/run test loop for a Linux VM
 python/              the first prototype in Python, kept for reference
 ```
