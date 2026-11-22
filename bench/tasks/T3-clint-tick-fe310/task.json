@@ -1,0 +1,17 @@
+{
+  "id": "T3-clint-tick-fe310",
+  "family": "F2",
+  "board": "fe310",
+  "target": "riscv32imac-unknown-none-elf",
+  "package": "t3-firmware",
+  "budget": {
+    "max_iterations": 20,
+    "max_tool_calls": 150,
+    "max_wall_min": 30,
+    "max_tokens": 2000000
+  },
+  "trials": 3,
+  "faults": [
+    "X9-period-truncated"
+  ]
+}

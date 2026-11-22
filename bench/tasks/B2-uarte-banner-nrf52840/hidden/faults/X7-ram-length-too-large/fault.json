@@ -1,0 +1,10 @@
+{
+  "id": "X7",
+  "class": "memory_map",
+  "peripheral": null,
+  "register": null,
+  "field": null,
+  "location": "memory.x:5",
+  "description": "memory.x gives RAM a length of 512K, but the nRF52840 has 256 KiB. cortex-m-rt puts the initial stack pointer at the end of RAM, 0x20080000, past the end of real RAM, so the first push faults.",
+  "symptom": "Crashes before the banner: nothing is printed after reset."
+}

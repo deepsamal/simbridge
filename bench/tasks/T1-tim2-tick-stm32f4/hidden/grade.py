@@ -1,6 +1,6 @@
 """Grader for T1: TIM2 1 kHz tick on STM32F4. Hidden from the agent."""
 
-from grading import line_times, reg_value, trace_all, uart_tx
+from grading import line_times, reg_value, trace_all, trace_counts, uart_tx
 
 TIMER_HZ = 16_000_000   # TIM2 clock at reset (16 MHz HSI, APB1 /1)
 RUN_S = 3.5             # virtual seconds to observe: start + three count lines
@@ -32,8 +32,10 @@ def grade(sb, elf, g):
 
     # Traces first: register reads below would otherwise appear in them.
     lines = line_times(uart_tx(trace_all(sb, "usart2", op="W", offset=0x4), "stm32f4"))
-    tim_w = sb.call("peripheral_trace", peripheral="timer2", op="W", limit=0)["total"]
-    tim_r = sb.call("peripheral_trace", peripheral="timer2", op="R", limit=0)["total"]
+    # One read for both counts: each trace read consumes the log.
+    tim = trace_counts(sb, "timer2")
+    tim_w = sum(c["W"] for c in tim.values())
+    tim_r = sum(c["R"] for c in tim.values())
 
     # 2. Exactly the expected lines, in order.
     text = [s for _, s in lines]

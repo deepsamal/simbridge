@@ -82,7 +82,8 @@ step 3) and are never committed.
 
 The roadmap and open questions are at the end of
 [`docs/design.md`](docs/design.md). In short: the server has everything the
-first benchmark run needs, tasks B1 and T1 exist, and next are tasks B2
-(nRF52840 UARTE), B3 (FE310 UART) and T3 (FE310 timer tick), then a pilot
-agent run. Skills beyond `svd-registers` are open: see the ideas at the end of
+first benchmark run needs, and tasks B1–B6, T1 and T3 exist and validate.
+Next is the agent runner and a pilot run on one model. Of the remaining v0
+tasks, T2 needs an instruction count and T4 needs GPIO input (button presses),
+both not built yet. Skills beyond `svd-registers` are open: see the ideas at the end of
 `skills/README.md`.

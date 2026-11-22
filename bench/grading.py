@@ -77,6 +77,34 @@ def reg_value(sb, peripheral, register):
     raise SimBridgeError(f"{peripheral}.{register} not decoded (is the SVD loaded?)")
 
 
+def trace_counts(sb, peripheral):
+    """Reads and writes since the last trace read, as {offset: {"R": n, "W": m}}
+    with offsets like "0x10". Consumes the log, like every trace read."""
+    return sb.call("peripheral_trace", peripheral=peripheral, limit=0)["counts"]
+
+
+def count(counts, op, *offsets):
+    """Sum of `op` ("R"/"W") accesses at the given offsets in a trace_counts() result."""
+    return sum(counts.get(hex(o).upper().replace("0X", "0x"), {}).get(op, 0) for o in offsets)
+
+
+def mem_u32(sb, addr):
+    """One little-endian 32-bit word from memory or a peripheral (address or symbol)."""
+    return int.from_bytes(bytes.fromhex(sb.call("mem", addr=addr, length=4)["hex"]), "little")
+
+
+def last_written(accesses):
+    """{offset: last value written} from trace accesses. Use it to grade
+    configuration: Renode models often don't keep registers they don't act on
+    (nRF52840 UARTE BAUDRATE, FE310 UART div), so reading them back with mem()
+    or regs() doesn't return what the firmware wrote."""
+    out = {}
+    for a in accesses:
+        if a["op"] == "W":
+            out[hexint(a["offset"])] = hexint(a["value"])
+    return out
+
+
 def trace_all(sb, peripheral, op=None, offset=None):
     """Every access logged since tracing was enabled or last read, optionally only
     reads/writes (op="R"/"W") at one register offset. Filter here rather than in

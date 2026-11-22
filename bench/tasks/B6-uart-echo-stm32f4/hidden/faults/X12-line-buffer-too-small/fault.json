@@ -1,0 +1,10 @@
+{
+  "id": "X12",
+  "class": "buffer_size",
+  "peripheral": "USART2",
+  "register": null,
+  "field": null,
+  "location": "src/main.rs:19",
+  "description": "The line buffer holds 64 bytes, but lines can be 128 bytes long. The excess is dropped, so long lines come back truncated.",
+  "symptom": "Long lines are echoed cut off after 64 characters."
+}

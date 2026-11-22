@@ -1,0 +1,13 @@
+[package]
+name = "t3-firmware"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+riscv = { version = "0.12", features = ["critical-section-single-hart"] }
+riscv-rt = "0.13"
+panic-halt = "1"
+
+[profile.release]
+debug = true
+opt-level = "s"

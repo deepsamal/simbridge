@@ -1,0 +1,10 @@
+{
+  "id": "X11",
+  "class": "data_format",
+  "peripheral": "SPIM2",
+  "register": null,
+  "field": null,
+  "location": "src/main.rs:77",
+  "description": "The LM74's 16-bit word holds the temperature in bits 15..3; the code uses the whole word without shifting it right by 3, so readings are 8 times too large (and the status bits leak into them).",
+  "symptom": "Temperatures 8 times too high: 23.50 reads as 188.00."
+}

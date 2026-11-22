@@ -22,7 +22,7 @@ and a benchmark that measures which of them actually help.
 |---|---|---|
 | simbridge, the MCP server | `src/`, this README | 7 boards; everything the benchmark's first run needs |
 | Skills | [`skills/`](skills/README.md) | `svd-registers` |
-| simbridge-bench | [`bench/`](bench/README.md), design in [`docs/design.md`](docs/design.md) | tasks B1 and T1 built and validated; agent runner not built yet |
+| simbridge-bench | [`bench/`](bench/README.md), design in [`docs/design.md`](docs/design.md) | tasks B1–B6, T1, T3 built and validated; agent runner not built yet |
 
 New here? Set up with the [Quick start](#quick-start), then read
 [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow.
@@ -194,15 +194,17 @@ time after the call) and `wall_ms` (the host time the call took).
 
 | tool | what it does |
 |---|---|
-| `load(elf, platform="stm32f4", uart?, cpu?, svd?)` | Creates a fresh machine and loads the ELF. `platform` is a preset (table below) or a `.repl` path, which then needs `uart` (and `cpu` if it isn't `sysbus.cpu`). `svd` overrides the preset's SVD (a path, a preset name, or `"none"`); it's parsed once, cached, and also given to Renode with `ApplySVD`. Returns the PC, `time_resolution_s`, the SVD device, `timer_clock_hz` on STM32 presets (see Limits) and any `warnings`. |
+| `load(elf, platform="stm32f4", uart?, cpu?, svd?, extra_repl?)` | Creates a fresh machine and loads the ELF. `platform` is a preset (table below) or a `.repl` path, which then needs `uart` (and `cpu` if it isn't `sysbus.cpu`). `svd` overrides the preset's SVD (a path, a preset name, or `"none"`); it's parsed once, cached, and also given to Renode with `ApplySVD`. `extra_repl` adds Renode `.repl` lines on top of the platform, e.g. a sensor on a bus: `"tmp108: Sensors.TMP108 @ i2c1 0x48"`; `reset` keeps it. Returns the PC, `time_resolution_s`, the SVD device, `timer_clock_hz` on presets that reclock timers (see Limits) and any `warnings`. |
 | `reset()` | Rebuilds the machine and reloads the same ELF, so virtual time goes back to 0. Traces stay enabled. |
 | `run_for(virtual_ms)` | Advances exactly that much virtual time, then pauses. Returns the PC. |
 | `run_until(uart_regex?, mem_addr?, mem_equals?, timeout_ms=1000, step_ms=1)` | Runs in `step_ms` slices until UART output matches the regex, or until the 32-bit word at `mem_addr` (address or ELF symbol) equals `mem_equals`, or until the timeout. Returns `hit`, `stop` (the reason), `elapsed_virtual_ms` and the UART text it saw. That text is consumed, so `serial()` won't return it again. The stop time is accurate to one step, and each step costs about 15–25 ms of wall time. |
 | `serial(max_bytes=4096)` | Returns UART output since the previous call, with `t_from` / `t_to`: the virtual-time window it was produced in. |
+| `uart_write(text?, hex?)` | Sends up to 4096 bytes to the console UART's receive line, as a host terminal would. Renode feeds them in as virtual time runs (about 0.3 ms per byte on the STM32F4), so call `run_for` after. |
+| `stimulus(peripheral, property, value)` | Sets a property of a simulated device, e.g. `stimulus(peripheral="i2c1.tmp108", property="Temperature", value=40)` for a sensor added with `extra_repl`. Numbers and booleans only. |
 | `regs(peripheral, count=8, offset=0, register?, verbose=false)` | Reads 32-bit words from a peripheral's bus window. With an SVD, each word is decoded into its register(s) and fields (bit range, value, matching enum name); `register="SR"` reads one register by name, `verbose` adds descriptions. The Renode peripheral is matched to the SVD by base address, so `gpioPortA` finds `GPIOA`. These are model reads, so registers with read side effects are affected (flagged as `read_side_effect` when the SVD says so). |
 | `svd(svd?, peripheral?, register?, value?, query?, limit=40)` | SVD lookup that doesn't touch the simulator. No arguments: list peripherals. `peripheral`: its registers. `peripheral` + `register`: every field with bits, access, description and enumerated values; add `value` to decode a number. `query`: regex search over names and descriptions. Uses the loaded machine's SVD unless `svd` names a path or preset. |
 | `mem(addr, length=64)` | Reads up to 1 KiB. `addr` can be a number, a `"0x..."` string or an ELF symbol such as `"TICKS"`. |
-| `peripheral_trace(peripheral, limit=50, disable=false, decode=false, op?, offset?)` | The first call turns on `LogPeripheralAccess`. Later calls return the accesses since the previous call: PC, R/W, offset, register name and value, the virtual time `t` in seconds, plus the CPU on multi-core boards. `total` counts every matching access; only the newest `limit` are returned. `op` (`"R"`/`"W"`) and `offset` (e.g. `"0x4"`) filter on the server, so "every write to DR" doesn't pull a million status polls. `time_resolution_s` gives the timestamp resolution (see Notes). `decode` adds the SVD field breakdown of each value. |
+| `peripheral_trace(peripheral, limit=50, disable=false, decode=false, op?, offset?)` | The first call turns on `LogPeripheralAccess`. Later calls return the accesses since the previous call: PC, R/W, offset, register name and value, the virtual time `t` in seconds, plus the CPU on multi-core boards. `total` counts every matching access; only the newest `limit` are returned. `op` (`"R"`/`"W"`) and `offset` (e.g. `"0x4"`) filter on the server, so "every write to DR" doesn't pull a million status polls. Each call consumes the log, so a second, differently filtered call sees nothing; `counts` gives reads and writes per register offset over everything the call scanned, whatever the filter. `time_resolution_s` gives the timestamp resolution (see Notes). `decode` adds the SVD field breakdown of each value. |
 | `snapshot()` / `restore(id)` | Renode `Save` / `Load` of the full state. Each reports how long it took. |
 | `monitor(command)` | **Grader mode only** (`SIMBRIDGE_MODE=grader`): one raw Renode monitor command. Never exposed to agents. |
 
@@ -234,7 +236,10 @@ platform, the console UART, the CPU to report, the SVD's path relative to the
 SVD folder, optional `svd_alias` entries for when the SVD has several views
 at one address and the Renode model matches a specific one, and, for chips
 whose Renode timers don't run at the chip's reset clock, the timers to reclock
-(`timers`, `timer_hz`). To have the smoke
+(`timers`, `timer_hz`). Model parameters Renode only accepts when the machine is
+built (constructor attributes) go in `overlay`: `.repl` lines that simbridge
+applies on top of the platform with `using`, as the FE310 preset does for its
+CLINT. To have the smoke
 test cover the new board, add a `firmware/<board>-hello` crate and an entry in
 `examples/smoke.rs`. The existing hello crates are about 40 lines each and share
 their banner and tick loop through `firmware/common/hello.rs`.
@@ -322,7 +327,7 @@ For benchmarking agents, `SIMBRIDGE_TOOLS` restricts what the agent can observe:
 
 | condition | tools |
 |---|---|
-| `C2` | `load`, `reset`, `run_for`, `run_until`, `serial` |
+| `C2` | `load`, `reset`, `run_for`, `run_until`, `serial`, `uart_write`, `stimulus` |
 | `C3` | C2 + `regs`, `mem`, `svd` |
 | `C4` | C3 + `peripheral_trace`, `snapshot`, `restore` (everything) |
 
@@ -384,11 +389,33 @@ The first call also pays Renode's cold start, about 1–5 s.
   timers to the chip's reset clock instead (F4: 16 MHz HSI, F103: 8 MHz HSI,
   L552: 4 MHz MSI; `load` reports `timer_clock_hz`), so firmware that keeps the
   reset clock times correctly. Firmware that switches to the PLL will not.
+  Likewise the FE310's `mtime` counts its 32.768 kHz real-time clock, where
+  Renode's `sifive-fe310.repl` runs the CLINT at 62 MHz; the `fe310` preset
+  loads the platform with the CLINT at 32768 Hz. SysTick is set the same way
+  (F4 16 MHz, F103 8 MHz, L552 4 MHz, nRF52840 64 MHz; Renode's platforms say
+  72, 72, 1 and its default); the F072 keeps Renode's default.
 - **STM32 timer period is one count short.** Renode's `STM32_Timer` reloads
   after ARR counts instead of ARR + 1, so update interrupts come 1/ARR fast
   (0.1% at ARR = 999), and firmware with ARR off by one (1000 for a 1 kHz tick
   from 1 MHz) looks exact. Graders check timer rates from PSC/ARR with the
   hardware formula as well as by measurement.
+- **Configuration registers don't always read back.** Some Renode models keep
+  only the registers they act on: the nRF52840 UARTE's `BAUDRATE` and
+  `PSEL.TXD`, and the FE310 UART's `div`, read back as 0 whatever was written.
+  `peripheral_trace` shows what the firmware actually wrote; graders use the
+  last value written.
+- **Polling a peripheral register is slow to simulate.** A firmware spinning on
+  a status register (waiting for RXNE, a timer flag or a DMA event) runs about
+  20–50 times slower than real time, so `run_for(1000)` can take tens of
+  seconds; tracing that peripheral at the same time slows it further. Firmware
+  that sleeps (`wfi`) between events runs at about real time. Graders keep their
+  runs short and stop tracing a peripheral that's being polled.
+- **Sensor models are simplified.** Renode's `Sensors.TMP108` holds whole
+  degrees only and puts flag bits in the low byte of its temperature register;
+  `Sensors.TI_LM74` keeps fractions. Renode's STM32 I²C model fetches
+  `I2CReadCount` bytes (default 1) from a device per transfer, and the TMP108
+  restarts its register on every fetch, so a 2-byte read needs
+  `I2CReadCount: 2` on the bus (B4's `extra_repl` sets it).
 - **Not cycle-accurate.** Virtual time is deterministic but not cycle-exact, and
   there's no analog, RF or sensor physics.
 - **Renode's boards only.** A chip without a Renode platform can't be run. For

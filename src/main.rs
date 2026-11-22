@@ -34,6 +34,27 @@ struct LoadArgs {
     /// CMSIS-SVD for register decoding: a path (absolute, or relative to the SVD
     /// directory), a preset name, or "none". Default: the platform preset's SVD.
     svd: Option<String>,
+    /// Extra Renode .repl lines applied on top of the platform, e.g. a sensor on a
+    /// bus: "tmp108: Sensors.TMP108 @ i2c1 0x48". Kept across reset().
+    extra_repl: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct UartWriteArgs {
+    /// Text to send (UTF-8). Use "\r" or "\n" for line endings as the firmware expects.
+    text: Option<String>,
+    /// Bytes to send as hex instead, e.g. "0d0a".
+    hex: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct StimulusArgs {
+    /// Model to change, e.g. "i2c1.tmp108" (a peripheral added with extra_repl).
+    peripheral: String,
+    /// Property, e.g. "Temperature".
+    property: String,
+    /// New value: a number or boolean.
+    value: Value,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -232,9 +253,40 @@ impl SimBridge {
                 a.uart.as_deref(),
                 a.cpu.as_deref(),
                 a.svd.as_deref(),
+                a.extra_repl.as_deref(),
             )
         })
         .await
+    }
+
+    #[tool(description = "Send bytes to the console UART's receive line, as a host terminal \
+        would. They arrive as virtual time runs: call run_for() or run_until() after. At most \
+        4096 bytes per call; give `text` or `hex`.")]
+    async fn uart_write(&self, Parameters(a): Parameters<UartWriteArgs>) -> String {
+        self.call(move |r| {
+            let bytes = match (a.text, a.hex) {
+                (Some(t), None) => t.into_bytes(),
+                (None, Some(h)) => {
+                    let h: String = h.chars().filter(|c| !c.is_whitespace()).collect();
+                    if h.len() % 2 != 0 {
+                        anyhow::bail!("hex needs an even number of digits");
+                    }
+                    (0..h.len()).step_by(2)
+                        .map(|i| u8::from_str_radix(&h[i..i + 2], 16))
+                        .collect::<Result<Vec<u8>, _>>()?
+                }
+                _ => anyhow::bail!("give exactly one of text or hex"),
+            };
+            r.uart_write(&bytes)
+        })
+        .await
+    }
+
+    #[tool(description = "Set a property of a simulated device, e.g. a sensor reading: \
+        peripheral=\"i2c1.tmp108\", property=\"Temperature\", value=40.0. For models added \
+        with load(extra_repl=...) or in the platform; takes effect immediately.")]
+    async fn stimulus(&self, Parameters(a): Parameters<StimulusArgs>) -> String {
+        self.call(move |r| r.stimulus(&a.peripheral, &a.property, &a.value)).await
     }
 
     #[tool(description = "Rebuild the machine from scratch and reload the same ELF \
@@ -380,7 +432,9 @@ impl SimBridge {
         logged since the previous call: pc, op (R/W), offset, register name, value. The first \
         call enables tracing and returns nothing; run_for, then call again. `total` counts \
         every matching access; only the last `limit` are returned. Filter with op/offset \
-        (e.g. op=\"W\", offset=\"0x4\") rather than raising limit.")]
+        (e.g. op=\"W\", offset=\"0x4\") rather than raising limit. Each call consumes the \
+        log: `counts` gives reads and writes per register offset for everything since the \
+        previous call, whatever the filter.")]
     async fn peripheral_trace(&self, Parameters(a): Parameters<TraceArgs>) -> String {
         self.call(move |r| {
             let filter = renode::TraceFilter::parse(a.op.as_deref(), a.offset.as_ref())?;

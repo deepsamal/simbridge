@@ -245,6 +245,13 @@ impl UartTap {
         Ok(Self { buf, sock })
     }
 
+    fn write(&self, bytes: &[u8]) -> Result<()> {
+        let mut s = &self.sock;
+        s.write_all(bytes)?;
+        s.flush()?;
+        Ok(())
+    }
+
     fn take(&self) -> (Vec<u8>, usize) {
         thread::sleep(Duration::from_millis(50)); // let in-flight bytes land after RunFor
         self.take_now()
@@ -270,6 +277,8 @@ struct Loaded {
     uart: String,
     cpu: String,
     svd: Option<PathBuf>,
+    /// Extra .repl lines given to load(), e.g. a sensor on a bus.
+    extra_repl: Option<String>,
 }
 
 impl Loaded {
@@ -287,7 +296,8 @@ impl Loaded {
     fn json(&self) -> Value {
         json!({"elf": self.elf.display().to_string(), "platform": self.platform,
                "repl": self.repl, "uart": self.uart, "cpu": self.cpu,
-               "svd": self.svd.as_ref().map(|p| p.display().to_string())})
+               "svd": self.svd.as_ref().map(|p| p.display().to_string()),
+               "extra_repl": self.extra_repl})
     }
 }
 
@@ -507,6 +517,7 @@ impl Renode {
         uart: Option<&str>,
         cpu: Option<&str>,
         svd_arg: Option<&str>,
+        extra_repl: Option<&str>,
     ) -> Result<Value> {
         if !elf.is_file() {
             bail!("ELF not found: {}", elf.display());
@@ -526,7 +537,8 @@ impl Renode {
             None => None,
         };
         let preset = crate::presets::find(platform);
-        let (repl, repl_arg, uart, cpu) = match preset {
+        let extra_repl = extra_repl.map(str::trim).filter(|s| !s.is_empty());
+        let (repl, mut repl_arg, uart, cpu) = match preset {
             Some(p) => (
                 p.repl.to_string(),
                 format!("@{}", p.repl),
@@ -545,6 +557,19 @@ impl Renode {
                 (platform.to_string(), q(Path::new(platform)), u.to_string(), c.to_string())
             }
         };
+        // Model parameters set before creation (preset overlay) and extra
+        // peripherals (extra_repl) go in one .repl that includes the platform.
+        let overlay: Vec<&str> = preset.map(|p| p.overlay).into_iter().chain(extra_repl)
+            .filter(|s| !s.is_empty()).collect();
+        if !overlay.is_empty() {
+            let base = match preset {
+                Some(p) => p.repl.to_string(),
+                None => abs(Path::new(platform))?.display().to_string().replace('\\', "/"),
+            };
+            let file = self.workdir.join("machine.repl");
+            std::fs::write(&file, format!("using \"{base}\"\n\n{}\n", overlay.join("\n\n")))?;
+            repl_arg = q(&file);
+        }
         self.cmd("Clear")?; // drop all machines (`mach clear` only deselects)
         self.traced.clear();
         self.cmd(&format!("mach create \"{MACHINE}\""))?;
@@ -560,7 +585,7 @@ impl Renode {
         };
         self.cmd(&format!("machine LoadPlatformDescription {repl_arg}"))?;
         let timer_hz = match preset {
-            Some(p) if !p.timers.is_empty() => {
+            Some(p) if p.timer_hz > 0 => {
                 for t in p.timers {
                     self.cmd(&format!("sysbus.{t} Frequency {}", p.timer_hz))?;
                 }
@@ -579,7 +604,8 @@ impl Renode {
                 Err(e) => warnings.push(format!("Renode ApplySVD failed (decoding still works): {e:#}")),
             }
         }
-        let loaded = Loaded { elf: abs(elf)?, platform: platform.to_string(), repl, uart, cpu, svd: svd_path };
+        let loaded = Loaded { elf: abs(elf)?, platform: platform.to_string(), repl, uart, cpu, svd: svd_path,
+                              extra_repl: extra_repl.map(str::to_string) };
         let mut info = loaded.json();
         self.loaded = Some(loaded);
         self.attach_uart()?;
@@ -590,7 +616,7 @@ impl Renode {
         }
         if let Some(hz) = timer_hz {
             info["timer_clock_hz"] = json!(hz);
-            info["clock_note"] = json!("timers run at the chip's reset clock; Renode does not model RCC/PLL changes");
+            info["clock_note"] = json!("timers run at the chip's reset clock (FE310: mtime at the 32.768 kHz RTC); Renode does not model clock-tree changes");
         }
         if let Some(d) = svd_dev {
             info["svd_device"] = json!(d.name);
@@ -606,11 +632,47 @@ impl Renode {
     }
 
     /// Deterministic reset: rebuild the machine from scratch and reload the ELF.
+    /// Sends bytes to the console UART's receive side, as a host would.
+    /// They are delivered as the simulation runs, so call run_for() after.
+    pub fn uart_write(&mut self, bytes: &[u8]) -> Result<Value> {
+        self.require_loaded()?;
+        if bytes.is_empty() {
+            bail!("nothing to send");
+        }
+        if bytes.len() > 4096 {
+            bail!("at most 4096 bytes per call");
+        }
+        let tap = self.uart.as_ref().ok_or_else(|| anyhow!("no UART terminal attached"))?;
+        tap.write(bytes)?;
+        thread::sleep(Duration::from_millis(20)); // let Renode take them before the next run
+        Ok(json!({"sent_bytes": bytes.len()}))
+    }
+
+    /// Sets a property of a simulated model, e.g. a sensor's Temperature.
+    pub fn stimulus(&mut self, peripheral: &str, property: &str, value: &Value) -> Result<Value> {
+        self.require_loaded()?;
+        static NAME: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z_][\w]*(\.[A-Za-z_][\w]*)*$").unwrap());
+        static PROP: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z_]\w*$").unwrap());
+        if !NAME.is_match(peripheral) || !PROP.is_match(property) {
+            bail!("peripheral must be a dotted name like i2c1.tmp108, property a name like Temperature");
+        }
+        let v = match value {
+            Value::Number(n) => n.to_string(),
+            Value::Bool(b) => b.to_string(),
+            v => bail!("value must be a number or boolean, not {v}"),
+        };
+        let path = if peripheral.starts_with("sysbus.") { peripheral.to_string() } else { format!("sysbus.{peripheral}") };
+        self.cmd(&format!("{path} {property} {v}"))?;
+        let now = self.cmd(&format!("{path} {property}")).unwrap_or_default();
+        Ok(json!({"peripheral": path, "property": property, "value": now.trim()}))
+    }
+
     pub fn reset(&mut self) -> Result<Value> {
         let l = self.require_loaded()?;
         let traced = self.traced.clone();
         let svd_arg = l.svd.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".into());
-        let info = self.load(&l.elf, &l.platform, Some(&l.uart), Some(&l.cpu), Some(&svd_arg))?;
+        let info = self.load(&l.elf, &l.platform, Some(&l.uart), Some(&l.cpu), Some(&svd_arg),
+                             l.extra_repl.as_deref())?;
         for p in traced {
             self.enable_trace(&p)?;
         }
@@ -880,11 +942,20 @@ impl Renode {
         let tag = Regex::new(&format!(r"[\] /]{}: \[cpu\w*:", regex::escape(&short)))?;
         // Keep only the newest `limit` matches; count the rest.
         let (mut kept, mut total, mut untimed) = (VecDeque::with_capacity(limit.min(4096)), 0usize, 0usize);
+        // Every access scanned, by register offset and R/W, whatever the filter:
+        // a read consumes the log, so this is the only way to count everything.
+        let mut counts: BTreeMap<String, [u64; 2]> = BTreeMap::new();
         let (consumed, synced) = self.scan_log_synced(start, |l| {
             if !tag.is_match(l) {
                 return;
             }
             let Some(c) = TRACE_RE.captures(l) else { return };
+            let off = match (parse_hex(&c[5]), base) {
+                (Ok(o), Some(b)) if o >= b => format!("0x{:X}", o - b),
+                (Ok(o), _) => format!("0x{o:X}"),
+                _ => c[5].to_string(),
+            };
+            counts.entry(off).or_default()[(&c[3][..1] == "W") as usize] += 1;
             if !filter.matches(&c[3][..1], &c[5], base) {
                 return;
             }
@@ -932,7 +1003,12 @@ impl Renode {
                 }
             }
         }
-        let mut out = json!({"peripheral": short, "total": total, "returned": tail.len(), "accesses": tail});
+        let counts: serde_json::Map<String, Value> = counts
+            .into_iter()
+            .map(|(k, [r, w])| (k, json!({"R": r, "W": w})))
+            .collect();
+        let mut out = json!({"peripheral": short, "total": total, "returned": tail.len(), "accesses": tail,
+                             "counts": counts});
         if let Some(q) = self.quantum_s {
             out["time_resolution_s"] = json!(q);
         }

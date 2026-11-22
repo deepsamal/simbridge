@@ -1,0 +1,10 @@
+{
+  "id": "X6",
+  "class": "address_encoding",
+  "peripheral": "I2C1",
+  "register": "DR",
+  "field": null,
+  "location": "src/main.rs:43",
+  "description": "The TMP108's address is given as 0x90, the datasheet's 8-bit write address, where the code expects the 7-bit address 0x48 and shifts it itself. The address byte sent is wrong, so no device acknowledges.",
+  "symptom": "Prints \"B4 sensor not found\" every second."
+}

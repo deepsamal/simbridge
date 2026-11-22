@@ -1,12 +1,13 @@
 # simbridge-bench: Design Doc
 
-Nov 9, 2026 · Deep Samal · last updated Nov 15, 2026
+Nov 9, 2026 · Deep Samal · last updated Nov 21, 2026
 
 > This is the version-controlled copy of the design. Change it through pull
 > requests like any other file. Status as of the last update: simbridge has
 > every change needed before the first run (allowlist, call log, grader mode,
-> virtual-time timestamps), and tasks **B1** and **T1** are built and validated
-> (see [`bench/`](../bench)). Next: B2, B3, T3, then the M1 pilot run.
+> virtual-time timestamps, UART input, sensor stimulus), and tasks **B1–B6, T1,
+> T3** are built and validated (see [`bench/`](../bench)). Next: the agent runner
+> and the M1 pilot run.
 
 ## Goal and research questions
 
@@ -71,11 +72,11 @@ v0 has 21 task definitions and 37 graded instances across five families and five
 | ID | Board | Task | Pass criteria |
 | --- | --- | --- | --- |
 | B1 | stm32f4 | USART2 banner at 115200 baud from 16 MHz HSI | Banner on UART; BRR = 0x8B, CR1 has UE and TE; trace shows DR writes |
-| B2 | nrf52840 | UARTE0 line output through EasyDMA | Banner on UART; trace shows TXD.PTR / TASKS\_STARTTX, no legacy TXD |
-| B3 | fe310 | UART0 banner with TX FIFO-full handling | Banner; txctrl.txen = 1; trace polls txdata.full |
-| B4 | stm32f4 | Read a TMP108 over I²C1 (addr 0x48), print °C once a second | Prints 23.5 then 40.0 after the grader changes the sensor. **Needs** sensor stimulus |
-| B5 | nrf52840 | Read a TI LM74 over SPI, print °C | Same as B4 over SPIM. **Needs** sensor stimulus |
-| B6 | stm32f4 | UART echo: return each received line in upper case | 20 scripted lines, including empty and 128-byte lines. **Needs** UART input |
+| B2 | nrf52840 | UARTE0 line output through EasyDMA | Banner on UART; trace shows TXD.PTR into RAM / TASKS\_STARTTX, no legacy TXD; ENABLE, BAUDRATE, PSEL.TXD as written. Built and validated 2026-11-16 |
+| B3 | fe310 | UART0 banner with TX FIFO-full handling | Banner; txctrl.txen = 1; trace polls txdata.full before every write; div gives 115200 ± 1% from 16 MHz. Built and validated 2026-11-16 |
+| B4 | stm32f4 | Read a TMP108 over I²C1 (addr 0x48), print °C once a second | Prints 23.00, then 41.00 and -7.00 after the grader changes the sensor (the simulated TMP108 holds whole degrees); "sensor not found" with no sensor on the bus; 1 s cadence; I2C1 at ≤ 100 kHz from 16 MHz. Built and validated 2026-11-21 |
+| B5 | nrf52840 | Read a TI LM74 over SPI, print °C | Prints 23.50, then 41.25 and -7.75 after the grader changes the sensor; SPIM2 with EasyDMA into RAM; CS (P0.20) framing each transfer; 1 s cadence. Built and validated 2026-11-21 |
+| B6 | stm32f4 | UART echo: return each received line in upper case | 19 scripted lines the spec doesn't show, including empty, 127- and 128-byte lines and a 16-line burst; RE set in CR1. Built and validated 2026-11-21 |
 
 ### F2 Timers and interrupts (4)
 
@@ -83,7 +84,7 @@ v0 has 21 task definitions and 37 graded instances across five families and five
 | --- | --- | --- | --- |
 | T1 | stm32f4 | TIM2 update interrupt at 1 kHz; print the count every 1000 ticks | Prints at 1.000 s virtual intervals ± 0.2%; PSC/ARR give exactly 1 kHz with the hardware formula; ISR is the source (trace). Built and validated 2026-11-14 |
 | T2 | nrf52840 | RTC0 at 8 Hz toggles LED1 (P0.13) | GPIO OUT edges every 125 ms ± 1 ms; no busy loop (CPU sleeps in WFI) |
-| T3 | fe310 | CLINT machine-timer tick at 100 Hz | Tick count in RAM = 100 ± 1 after 1 s virtual |
+| T3 | fe310 | CLINT machine-timer tick at 100 Hz | Tick count in RAM = 100 ± 1 after 1 s and 200 ± 1 after 2 s virtual, exactly 1000 at 10.005 s (no drift from rounding 327.68); mtimecmp rewritten per tick, mtime not polled. Built and validated 2026-11-16 |
 | T4 | stm32f4 | Count button presses with 20 ms debounce | 10 presses with 5 ms bounce → count 10. **Needs** GPIO input |
 
 ### F3 Bug fix and F8 Diagnosis: eight seeded faults
@@ -100,6 +101,12 @@ Each fault is planted in the reference solution of the task named. F3a gives the
 | X6 | B4 | 8-bit I²C address 0x90 used where 7-bit 0x48 is expected | Address encoding | Prints "sensor not found" |
 | X7 | B2 | `memory.x` RAM length larger than the chip's RAM; stack starts past the end | Memory map | Crashes before the banner (no src) |
 | X8 | T2 | LED on P0.14 instead of P0.13 (wrong pin constant) | Wrong peripheral instance | LED1 never blinks (no src) |
+| X9 (added) | T3 | Tick deadline computed as `tick * (32768 / 100)`: 327-count period | Configuration arithmetic | TICKS runs fast: 1002 instead of 1000 after 10 s |
+| X10 (added) | B3 | `txctrl.txen` never set | Missing enable | Nothing is printed after reset |
+| X11 (added) | B5 | LM74 word used without shifting right by 3 | Data format | Temperatures 8 times too high: 23.50 reads as 188.00 |
+| X12 (added) | B6 | 64-byte line buffer where lines can be 128 bytes | Buffer size | Long lines are echoed cut off after 64 characters |
+
+X9–X12 were added while building T3, B3, B5 and B6, so that every v0 task has at least one fault proving its grader can fail.
 
 ### F4 Porting (3)
 
@@ -174,7 +181,7 @@ Every task runs under six conditions that each add one kind of feedback to the o
 | --- | --- | --- |
 | C0 Compile only | Shell, editor, `cargo build`; no simbridge | EmbedBench with compiler feedback |
 | C1 Pass/fail | C0 + a `check` tool that returns pass or fail for the visible test only | Embedded Arena score-only |
-| C2 Console | C1 + `load`, `run_for`, `run_until`, `serial`, `reset` | A board with a serial monitor |
+| C2 Console | C1 + `load`, `run_for`, `run_until`, `serial`, `reset`, `uart_write`, `stimulus` | A board with a serial monitor and a bench (inputs the test needs) |
 | C3 Registers | C2 + `regs`, `mem`, `svd` | A debugger with an SVD viewer |
 | C4 Bus trace | C3 + `peripheral_trace`, `snapshot`, `restore` | Beyond what real hardware offers |
 | C5 Skill | C4 + the `svd-registers` skill in context | Expert guidance, as in IoT-SkillsBench |
@@ -247,11 +254,12 @@ Seven additions, three of them needed before the first v0 run. The Renode mechan
 | Call log (`SIMBRIDGE_LOG`, JSONL) | One record of simulator use for any agent or harness; proves which tools each condition exposed; context added per call | All metrics | None: one line per tool call with args, result size, wall and virtual time | Done: smoke test passed on Windows, 2026-11-09 |
 | Grader mode | `grade.py` drives a separate instance with stimulus and checks | All grading | Same binary, driven as a library or over stdio by the grader | Done: B1 validates on Windows (reference 1.0, X1 0.33), 2026-11-11. Needed a trace fix: Renode's log is now flushed per write and synced with a marker line |
 | Virtual-time timestamps on UART and trace events | Timing checks for T1–T3; F2 grading | F2 | Renode log stamped in virtual time via simbridge's own --config (log-timestamps-type = Virtual); resolution = global quantum, 100 us default; serial() reports its virtual-time window | Done: smoke passed on all 7 boards on Windows, 2026-11-13; resolution 100 us confirmed |
-| UART input (`uart_write`) | Echo, shells, protocols | B6, F5 | Write bytes to the socket terminal simbridge already holds | Before B6 |
-| Stimulus: GPIO input and sensor values | Buttons, sensors | B4, B5, T4 | Button and sensor models added to the platform, set through their monitor properties | Before B4/B5/T4 |
+| UART input (`uart_write`) | Echo, shells, protocols | B6, F5 | Write bytes to the socket terminal simbridge already holds | Done 2026-11-21: B6 validates. Renode feeds bytes in at ~0.3 ms each on the F4 |
+| Stimulus: GPIO input and sensor values | Buttons, sensors | B4, B5, T4 | Button and sensor models added to the platform, set through their monitor properties | Sensors done 2026-11-21: `load(extra_repl)` attaches a device, `stimulus` sets a property; B4 and B5 validate. GPIO input (T4) still to do |
 | Instruction count | F9 optimization; idle detection for T2 | T2, F9 | CPU's executed-instruction counter | Before T2 |
 | Trace filters and streaming (added) | A firmware spinning on a status register logs millions of accesses; graders need "every write to DR" without pulling them all | All graders | `peripheral_trace(op, offset)`; the log is streamed line by line, keeping only the newest `limit` matches | Done 2026-11-13: B1's X1 no longer runs simbridge out of memory |
-| Timers at the chip's reset clock (added) | Renode clocks every STM32 timer at a fixed 10 MHz, so firmware correct on hardware times wrong | T1, T4, any STM32 timer task | Presets set each timer's `Frequency` at load (F4 16 MHz, F103 8 MHz, L552 4 MHz) | Done 2026-11-14: T1 validates |
+| Timers at the chip's reset clock (added) | Renode clocks every STM32 timer at a fixed 10 MHz, and the FE310 CLINT at 62 MHz instead of the 32.768 kHz RTC, so firmware correct on hardware times wrong | T1, T3, T4, any timer task | Presets set each STM32 timer's `Frequency` at load (F4 16 MHz, F103 8 MHz, L552 4 MHz); the fe310 preset loads a `.repl` overlay with the CLINT at 32768 Hz | Done 2026-11-14 (STM32, T1 validates) and 2026-11-16 (FE310, T3 validates) |
+| Per-register trace counts (added) | Each trace read consumes the log, so a second, filtered read sees nothing: T1's "no polling" check always saw 0 reads | Graders counting reads and writes | Every `peripheral_trace` result carries `counts`: reads and writes per offset over everything scanned | Done 2026-11-16; T1's check fixed and revalidated |
 
 The log line format is fixed now so every later analysis reads the same fields:
 
@@ -279,7 +287,7 @@ M0 is the accent: it's the next piece of work, and every later phase depends on 
 | Renode doesn't model a behaviour a fault depends on (clock gating, baud rate) | Fault invisible, task unfair | Differential check: reference passes, fault fails, before a task is accepted |
 | Agents learn simulator quirks (TXE always 1) | Firmware passes in simulation, fails on silicon | M3 hardware cross-check on 1–2 real boards; quirks listed in each task's spec |
 | Resolved 2026-11-13: trace lines now carry virtual time (100 us resolution). Previously: no way to timestamp trace lines in virtual time | T1–T3 timing checks can't be written | Spike in M0: Renode log options, or stepped runs with `run_until` |
-| Simulator fidelity gaps found while building T1: STM32 timers fixed at 10 MHz, and `STM32_Timer` reloading after ARR counts instead of ARR + 1 | Correct firmware times wrong, or an ARR off-by-one looks exact | Presets set the timer clock; T1's grader checks the rate from PSC/ARR with the hardware formula as well as by measurement. Report the ARR bug upstream |
+| Simulator fidelity gaps found while building tasks: STM32 timers fixed at 10 MHz; `STM32_Timer` reloading after ARR counts instead of ARR + 1; FE310 CLINT at 62 MHz; SysTick at the wrong rate on four boards; nRF52840 UARTE and FE310 UART not keeping configuration registers (they read back 0); TMP108 model integer-only, and STM32 I²C fetching one byte per device read; register polling simulating 20–50× slower than real time | Correct firmware times wrong, an ARR off-by-one looks exact, register checks fail correct firmware | Presets set timer clocks; T1's grader checks the rate from PSC/ARR with the hardware formula as well as by measurement; graders check configuration from the values written (trace), not read back. Report the ARR bug upstream |
 | Contamination: tasks leak into training data | Inflated scores later | Keep a private hold-out set of faults; rotate seeded faults per release |
 | Run cost: 618 runs per model | Budget | Pilot in M1 on one model; drop conditions that show no difference |
 | Grader bugs | Wrong scores | Every grader runs against the reference and every fault in CI |

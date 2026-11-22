@@ -132,7 +132,7 @@ async fn main() -> Result<()> {
     let c2 = ().serve(TokioChildProcess::new(cmd)?).await?;
     let mut names: Vec<String> = c2.list_all_tools().await?.into_iter().map(|t| t.name.to_string()).collect();
     names.sort();
-    ensure!(names == ["load", "reset", "run_for", "run_until", "serial"], "C2 exposes {names:?}");
+    ensure!(names == ["load", "reset", "run_for", "run_until", "serial", "stimulus", "uart_write"], "C2 exposes {names:?}");
     let regs = CallToolRequestParams::new("regs")
         .with_arguments(json!({"peripheral": "usart2"}).as_object().cloned().unwrap_or_default());
     ensure!(c2.call_tool(regs).await.is_err(), "regs was callable under C2");

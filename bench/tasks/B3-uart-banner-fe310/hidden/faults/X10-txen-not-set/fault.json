@@ -1,0 +1,10 @@
+{
+  "id": "X10",
+  "class": "missing_enable",
+  "peripheral": "UART0",
+  "register": "txctrl",
+  "field": "txen",
+  "location": "src/main.rs:25",
+  "description": "The transmitter is never enabled: txctrl.txen stays 0, so bytes written to txdata are never sent.",
+  "symptom": "Nothing is printed after reset."
+}

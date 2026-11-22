@@ -79,7 +79,15 @@ A result looks like:
 3. Write `hidden/reference/` and make it pass. Write `hidden/grade.py`:
    `CHECKS = {name: weight}` and `grade(sb, elf, g)`. Read traces before calling
    `regs`/`mem` (model reads show up in traces), and filter traces with
-   `op`/`offset` rather than pulling every access.
+   `op`/`offset` rather than pulling every access. Each trace read consumes the
+   log: get everything one peripheral needs from one call (its `counts`, or
+   `trace_counts()`), not from several filtered calls. Grade configuration
+   registers by the value written (`last_written()`), not by reading them
+   back: some Renode models don't keep them. Sensors and other devices are
+   attached with `load(extra_repl=...)` and driven with `stimulus`; UART input
+   with `uart_write`. Keep runs short, and disable tracing on a peripheral the
+   firmware polls (`peripheral_trace(disable=True)`): polling is slow to
+   simulate (main README, Limits).
 4. Add each seeded fault as `hidden/faults/<id>/` with the replaced files and a
    `fault.json` (class, peripheral, register, field, location, description,
    symptom). A fault must build without warnings: a warning such as "unused
@@ -96,4 +104,10 @@ A result looks like:
 | id | family | board | seeded faults |
 |---|---|---|---|
 | B1-uart-banner-stm32f4 | F1 bring-up | stm32f4 | X1: polls RXNE instead of TXE |
+| B2-uarte-banner-nrf52840 | F1 bring-up | nrf52840 | X7: memory.x RAM length 512K, past the end of RAM |
+| B3-uart-banner-fe310 | F1 bring-up | fe310 | X10: txctrl.txen never set |
+| B4-i2c-tmp108-stm32f4 | F1 bring-up (I²C sensor) | stm32f4 | X6: 8-bit address 0x90 where the 7-bit 0x48 is expected |
+| B5-spim-lm74-nrf52840 | F1 bring-up (SPI sensor) | nrf52840 | X11: LM74 word not shifted right by 3 |
+| B6-uart-echo-stm32f4 | F1 bring-up (UART input) | stm32f4 | X12: 64-byte line buffer for 128-byte lines |
 | T1-tim2-tick-stm32f4 | F2 timers & interrupts | stm32f4 | X2: tick read not volatile; X3: UIF not cleared; X4: PSC 16 not 15; X5: NVIC not enabled |
+| T3-clint-tick-fe310 | F2 timers & interrupts | fe310 | X9: tick period truncated to 327 counts (100.2 Hz) |

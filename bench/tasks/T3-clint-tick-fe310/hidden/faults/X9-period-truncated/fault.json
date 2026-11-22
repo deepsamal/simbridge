@@ -1,0 +1,10 @@
+{
+  "id": "X9",
+  "class": "configuration_arithmetic",
+  "peripheral": "CLINT",
+  "register": "mtimecmp",
+  "field": null,
+  "location": "src/main.rs:48",
+  "description": "The tick deadline is computed as tick * (32768 / 100): the integer division happens first and gives a 327-count period, 0.2% short of 327.68, so the tick runs at 100.2 Hz.",
+  "symptom": "TICKS runs fast: 1002 instead of 1000 after 10 s."
+}

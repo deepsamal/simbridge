@@ -21,6 +21,15 @@ pub struct Preset {
     /// here at the reset clock. (Renode doesn't follow RCC changes.)
     pub timers: &'static [&'static str],
     pub timer_hz: u64,
+    /// Extra `.repl` lines applied on top of `repl`, for model parameters that
+    /// can only be set before the machine is built (constructor attributes):
+    /// the STM32 presets put SysTick on the reset clock (Renode's platforms say
+    /// 72 MHz for the F4/F103, 1 MHz for the L552), the nRF52840 on its 64 MHz
+    /// core clock (the platform leaves Renode's default), the FE310 its CLINT on
+    /// the RTC.
+    /// simbridge writes `using "<repl>"` plus these lines to its work folder
+    /// and loads that instead. Empty for none.
+    pub overlay: &'static str,
 }
 
 const STM32_TIMERS_1_14: &[&str] = &[
@@ -38,6 +47,7 @@ pub const PRESETS: &[Preset] = &[
         svd_alias: &[],
         timers: STM32_TIMERS_1_14,
         timer_hz: 16_000_000,
+        overlay: "nvic:\n    systickFrequency: 16000000\n",
     },
     Preset {
         names: &["fe310", "hifive1"],
@@ -47,7 +57,10 @@ pub const PRESETS: &[Preset] = &[
         svd: "e310x/e310x/e310x.svd",
         svd_alias: &[],
         timers: &[],
-        timer_hz: 0,
+        // mtime counts the 32.768 kHz RTC oscillator on the FE310 (HiFive1);
+        // Renode's sifive-fe310.repl runs the CLINT at 62 MHz.
+        timer_hz: 32_768,
+        overlay: "clint:\n    frequency: 32768\n",
     },
     Preset {
         names: &["nrf52840"],
@@ -59,6 +72,7 @@ pub const PRESETS: &[Preset] = &[
         svd_alias: &[("uart0", "UARTE0"), ("uart1", "UARTE1")],
         timers: &[],
         timer_hz: 0,
+        overlay: "nvic:\n    systickFrequency: 64000000\n",
     },
     Preset {
         names: &["stm32f103", "bluepill"],
@@ -69,6 +83,7 @@ pub const PRESETS: &[Preset] = &[
         svd_alias: &[],
         timers: STM32_TIMERS_1_14,
         timer_hz: 8_000_000,
+        overlay: "nvic:\n    systickFrequency: 8000000\n",
     },
     Preset {
         names: &["stm32f072"],
@@ -79,6 +94,7 @@ pub const PRESETS: &[Preset] = &[
         svd_alias: &[],
         timers: &[],
         timer_hz: 0,
+        overlay: "",
     },
     Preset {
         names: &["stm32l552"],
@@ -89,6 +105,7 @@ pub const PRESETS: &[Preset] = &[
         svd_alias: &[],
         timers: &["timer1", "timer2", "timer3", "timer4", "timer5", "timer6", "timer7", "timer8", "timer15", "timer16", "timer17"],
         timer_hz: 4_000_000,
+        overlay: "nvic:\n    systickFrequency: 4000000\n",
     },
     Preset {
         names: &["k210", "kendryte_k210"],
@@ -99,6 +116,7 @@ pub const PRESETS: &[Preset] = &[
         svd_alias: &[],
         timers: &[],
         timer_hz: 0,
+        overlay: "",
     },
 ];
 

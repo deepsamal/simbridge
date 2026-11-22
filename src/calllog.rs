@@ -19,13 +19,13 @@ use serde_json::{json, Value};
 /// Feedback conditions from the benchmark design: each adds tools to the last.
 /// C0 (compile only) and C1 (pass/fail) don't run simbridge at all.
 pub const CONDITIONS: &[(&str, &[&str])] = &[
-    ("C2", &["load", "reset", "run_for", "run_until", "serial"]),
-    ("C3", &["load", "reset", "run_for", "run_until", "serial", "regs", "mem", "svd"]),
+    ("C2", &["load", "reset", "run_for", "run_until", "serial", "uart_write", "stimulus"]),
+    ("C3", &["load", "reset", "run_for", "run_until", "serial", "uart_write", "stimulus", "regs", "mem", "svd"]),
     (
         "C4",
         &[
-            "load", "reset", "run_for", "run_until", "serial", "regs", "mem", "svd",
-            "peripheral_trace", "snapshot", "restore",
+            "load", "reset", "run_for", "run_until", "serial", "uart_write", "stimulus", "regs",
+            "mem", "svd", "peripheral_trace", "snapshot", "restore",
         ],
     ),
 ];
@@ -153,11 +153,11 @@ mod tests {
         assert_eq!(parse_allowlist(None, &all()).unwrap(), None);
         assert_eq!(parse_allowlist(Some("all"), &all()).unwrap(), None);
         let c2 = parse_allowlist(Some("C2"), &all()).unwrap().unwrap();
-        assert_eq!(c2.len(), 5);
+        assert_eq!(c2.len(), 7);
         assert!(!c2.contains("regs"));
         let mixed = parse_allowlist(Some("c2, svd"), &all()).unwrap().unwrap();
         assert!(mixed.contains("svd") && mixed.contains("load") && !mixed.contains("regs"));
         assert!(parse_allowlist(Some("C3 regz"), &all()).is_err());
-        assert_eq!(parse_allowlist(Some("C4"), &all()).unwrap().unwrap().len(), 11);
+        assert_eq!(parse_allowlist(Some("C4"), &all()).unwrap().unwrap().len(), 13);
     }
 }
